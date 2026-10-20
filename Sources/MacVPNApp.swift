@@ -33,6 +33,7 @@ struct BackendStatus: Decodable {
     let profiles: [String: VPNStatus]
     let route_overlaps: [VPNOverlap]
     var stopping: Bool? = nil
+    var reconnect_support: Int? = nil
 }
 
 struct BridgeResponse: Decodable { let state: BackendStatus }
@@ -146,7 +147,7 @@ final class VPNModel: ObservableObject {
                     "office-primary": VPNStatus(phase: "disconnected", desired: false, auto_reconnect: true, virtual_ips: [], remote_subnets: [], next_retry: 0),
                     "office-backup": VPNStatus(phase: "connected", desired: true, auto_reconnect: true, virtual_ips: ["10.20.0.2"], remote_subnets: ["10.30.0.0/24"], next_retry: 0),
                     "partner": VPNStatus(phase: "reconnecting", desired: true, auto_reconnect: true, virtual_ips: [], remote_subnets: [], next_retry: Date().timeIntervalSince1970 + 28)
-                ], route_overlaps: [])
+                ], route_overlaps: [], reconnect_support: 1)
         } else {
             refresh()
             timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -157,7 +158,7 @@ final class VPNModel: ObservableObject {
 
     var fresh: Bool { state.map { now.timeIntervalSince1970 - $0.timestamp < 20 } ?? false }
     var stopping: Bool { fresh && state?.stopping == true }
-    var ready: Bool { fresh && !stopping && state?.version == 4 && state?.engine_ready == true && state?.config_path == configURL.path }
+    var ready: Bool { fresh && !stopping && state?.version == 4 && state?.engine_ready == true && (state?.reconnect_support ?? 0) >= 1 && state?.config_path == configURL.path }
     var activeCount: Int { fresh ? state?.profiles.values.filter { $0.phase == "connected" }.count ?? 0 : 0 }
     var working: Bool { ready && state?.profiles.values.contains { ["connecting", "reconnecting", "disconnecting"].contains($0.phase) } == true }
     var summary: String { stopping ? "正在停止后台…" : (ready ? (activeCount > 0 ? "\(activeCount) 条 VPN 已连接" : "后台就绪") : "后台尚未启用") }

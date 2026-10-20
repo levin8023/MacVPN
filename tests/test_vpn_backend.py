@@ -450,7 +450,7 @@ class ConfigTests(unittest.TestCase):
             self.assertIn('ike-' + name + ' {', text)
             self.assertIn('xauth-' + name + ' {', text)
 
-    def test_app_upgrade_restores_requested_profile_through_renamed_alias(self):
+    def test_app_upgrade_without_reconnect_support_restores_requested_profile_through_alias(self):
         import app_bridge
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -463,7 +463,7 @@ class ConfigTests(unittest.TestCase):
             def fake_rpc(runtime, request, **kwargs):
                 calls.append(request)
                 if len(calls) == 1:
-                    return dict(state=dict(version=2, profiles={'old-one': {'desired': True},
+                    return dict(state=dict(version=4, direct_gateway_support=2, profiles={'old-one': {'desired': True},
                                                                'other': {'desired': False}}))
                 return dict(state=dict(version=3, profiles={}))
 

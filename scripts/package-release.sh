@@ -15,6 +15,7 @@ cp README.md config.example.json CHANGELOG.md "$STAGE/MacVPN/"
 if [ -f LICENSE ]; then cp LICENSE "$STAGE/MacVPN/"; fi
 ARCHIVE="$TASK_ROOT/dist/MacVPN-$VERSION-macos-arm64.zip"
 /usr/bin/ditto -c -k --norsrc --noextattr --noqtn --keepParent "$STAGE/MacVPN" "$ARCHIVE"
+/usr/bin/python3 "$TASK_ROOT/scripts/verify-release.py" "$ARCHIVE"
 cd "$TASK_ROOT/dist"
 /usr/bin/shasum -a 256 "$(basename "$ARCHIVE")" > SHA256SUMS
 printf '%s\n' "$ARCHIVE"
