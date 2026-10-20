@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "default_profile": "office-primary",
+  "profiles": {
+    "office-primary": {
+      "label": "Primary VPN",
+      "server": "192.0.2.10",
+      "group": "",
+      "username": "",
+      "password": "",
+      "shared_secret": "",
+      "direct_gateway": false
+    },
+    "office-backup": {
+      "label": "Backup VPN",
+      "server": "192.0.2.11",
+      "group": "",
+      "username": "",
+      "password": "",
+      "shared_secret": "",
+      "direct_gateway": false
+    },
+    "partner": {
+      "label": "Partner VPN",
+      "server": "198.51.100.10",
+      "group": "",
+      "username": "",
+      "password": "",
+      "shared_secret": "",
+      "direct_gateway": false
+    }
+  }
+}

@@ -1,0 +1,20 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test-and-build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline backend tests
+        run: ./scripts/test.sh
+      - name: Build native app
+        run: ./build-app.sh
+      - name: Check panel layout
+        run: build/MacVPN.app/Contents/MacOS/MacVPN --check-layout
+      - name: Verify bundle signature
+        run: codesign --verify --strict build/MacVPN.app

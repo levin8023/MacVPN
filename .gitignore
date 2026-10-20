@@ -1,0 +1,37 @@
+# Local credentials and private experiments
+config.local.json
+*.local.json
+config.local*.json
+.env
+.env.*
+!.env.example
+.secrets/
+.local/
+
+# Build and release output
+.build/
+build/
+dist/
+*.app/
+*.dSYM/
+*.zip
+*.dmg
+
+# Python and test caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime / editor / OS files
+*.log
+*.pid
+*.sock
+.DS_Store
+.AppleDouble
+.idea/
+.vscode/
+*.swp

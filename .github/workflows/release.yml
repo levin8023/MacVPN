@@ -1,0 +1,28 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate version tag
+        run: test "$GITHUB_REF_NAME" = "v$(cat VERSION)"
+      - name: Offline backend tests
+        run: ./scripts/test.sh
+      - name: Package app
+        run: ./scripts/package-release.sh
+      - name: Check panel layout
+        run: build/MacVPN.app/Contents/MacOS/MacVPN --check-layout
+      - name: Publish preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          dist/MacVPN-*-macos-arm64.zip dist/SHA256SUMS
+          --verify-tag --prerelease --title "MacVPN $GITHUB_REF_NAME"
+          --notes-file CHANGELOG.md
