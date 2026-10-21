@@ -3,7 +3,7 @@
 轻量的 macOS 菜单栏 VPN 客户端，通过本机 strongSwan 管理 Cisco IPSec（IKEv1 PSK + XAuth）连接。
 提供连接状态、多线路并发、按线路断开、自动重连和路由检查。
 
-当前为 **0.2.1 预览版**，支持 Apple Silicon。它适用于已有的兼容 VPN 网关，不包含 VPN 服务端。
+当前为 **0.2.2 预览版**，支持 Apple Silicon。它适用于已有的兼容 VPN 网关，不包含 VPN 服务端。
 
 ## 安装
 

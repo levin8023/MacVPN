@@ -516,6 +516,18 @@ enum PanelLayout {
         return (frame, NSSize(width: width, height: height))
     }
 
+    static func restored(previous: NSRect, visible: NSRect) -> (frame: NSRect, content: NSSize) {
+        // Keep the panel where editing began; only clamp if the display changed.
+        let bounds = visible.insetBy(dx: 8, dy: 8)
+        var frame = previous
+        frame.size.width = min(frame.width, bounds.width)
+        frame.size.height = min(frame.height, bounds.height)
+        frame.origin.x = max(bounds.minX, min(frame.minX, bounds.maxX - frame.width))
+        frame.origin.y = max(bounds.minY, min(frame.minY, bounds.maxY - frame.height))
+        let content = NSWindow.contentRect(forFrameRect: frame, styleMask: style).size
+        return (frame, content)
+    }
+
     static func check() {
         // Regression cases: short displays and monitors with negative coordinates.
         for visible in [NSRect(x: 0, y: 0, width: 1280, height: 600),
@@ -531,7 +543,18 @@ enum PanelLayout {
                 }
             }
         }
-        print("PASS: 36 panel placement cases fit within the visible display.")
+        let mainDisplay = NSRect(x: 0, y: 38, width: 1512, height: 900)
+        let menuPosition = NSRect(x: 1030, y: 400, width: 392, height: 522)
+        precondition(restored(previous: menuPosition, visible: mainDisplay).frame == menuPosition,
+                     "Returning from editing moved the menu panel")
+        let movedPosition = NSRect(x: 240, y: 150, width: 392, height: 522)
+        precondition(restored(previous: movedPosition, visible: mainDisplay).frame == movedPosition,
+                     "Returning from editing moved a user-positioned panel")
+        let smallerDisplay = NSRect(x: -800, y: -500, width: 600, height: 440)
+        let fallback = restored(previous: menuPosition, visible: smallerDisplay)
+        precondition(smallerDisplay.contains(fallback.frame), "Panel did not fit the remaining display")
+        precondition(fallback.content.height > 0 && fallback.content.width > 0)
+        print("PASS: 36 panel placement cases and editor return-position regressions.")
     }
 }
 
@@ -550,6 +573,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var localMonitor: Any?
     var globalMonitor: Any?
     var editorWindow: NSWindow?
+    var editorReturnFrame: NSRect?
+    var terminating = false
     var openedAt: TimeInterval = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -609,10 +634,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             editorWindow.makeKeyAndOrderFront(nil)
             return
         }
+        editorReturnFrame = panel.frame
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 510, height: 610),
                               styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = id == nil ? "新增 VPN" : "编辑 VPN"
         window.isReleasedWhenClosed = false
+        window.delegate = self
         window.minSize = NSSize(width: 400, height: 420)
         let editorHost = NSHostingController(rootView: ProfileEditor(
             draft: model.draft(for: id), editing: id != nil,
@@ -620,8 +647,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 guard let self else { return }
                 try self.model.save(draft)
                 window?.close()
-                self.showPanel()
-            }, cancel: { [weak self, weak window] in window?.close(); self?.showPanel() }))
+            }, cancel: { [weak window] in window?.close() }))
         editorHost.sizingOptions = []
         window.contentViewController = editorHost
         editorWindow = window
@@ -633,6 +659,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.close()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === editorWindow else { return }
+        let previous = editorReturnFrame
+        editorWindow = nil
+        editorReturnFrame = nil
+        // Wait until the editor has finished closing before making the panel key.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.terminating, self.editorWindow == nil, !self.panel.isVisible else { return }
+            if let previous { self.restorePanel(previous: previous) }
+            else { self.present(anchored: true) }
+        }
+    }
+
+    func restorePanel(previous: NSRect) {
+        let screens = NSScreen.screens
+        let matching = screens.max { left, right in
+            let a = previous.intersection(left.visibleFrame)
+            let b = previous.intersection(right.visibleFrame)
+            return (a.isNull ? 0 : a.width * a.height) < (b.isNull ? 0 : b.width * b.height)
+        }
+        let overlaps = matching.map { previous.intersects($0.visibleFrame) } ?? false
+        guard let screen = overlaps ? matching : (NSScreen.main ?? screens.first) else { return }
+        openedAt = ProcessInfo.processInfo.systemUptime
+        model.refresh()
+        let layout = PanelLayout.restored(previous: previous, visible: screen.visibleFrame)
+        host.rootView = MenuContent(model: model, size: layout.content)
+        panel.setFrame(layout.frame, display: true)
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        terminating = true
+        return .terminateNow
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

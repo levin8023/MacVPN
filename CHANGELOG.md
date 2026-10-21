@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+
+- Restore the menu panel to its pre-edit position after Save, Cancel, or the window close button.
+- Keep manually positioned panels in place and clamp safely when a display is removed.
+- Avoid reopening the panel during application exit.
+
 ## 0.2.1
 
 - Remove empty-state explanatory copy and the implementation footer from the panel.
