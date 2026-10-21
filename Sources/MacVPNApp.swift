@@ -490,7 +490,6 @@ struct MenuContent: View {
                 }.foregroundStyle(.red).padding(10).background(Color.red.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
             }
             HStack {
-                Text("strongSwan · 多线路独立连接").font(.system(size: 10)).foregroundStyle(.tertiary)
                 Spacer()
                 Button { model.refresh() } label: { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain)
                     .help("刷新状态")

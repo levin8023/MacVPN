@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Remove empty-state explanatory copy and the implementation footer from the panel.
+- Respect read-only storage directories and preserve existing profiles when saving fails.
+
 ## 0.2.0
 
 - Create, edit, and delete VPN profiles directly in the app, with masked authentication fields.
