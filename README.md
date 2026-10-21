@@ -3,7 +3,7 @@
 轻量的 macOS 菜单栏 VPN 客户端，通过本机 strongSwan 管理 Cisco IPSec（IKEv1 PSK + XAuth）连接。
 提供连接状态、多线路并发、按线路断开、自动重连和路由检查。
 
-当前为 **0.2.2 预览版**，支持 Apple Silicon。它适用于已有的兼容 VPN 网关，不包含 VPN 服务端。
+当前为 **0.2.3 预览版**，支持 Apple Silicon。它适用于已有的兼容 VPN 网关，不包含 VPN 服务端。
 
 ## 安装
 
@@ -27,7 +27,11 @@
 
 App 使用 `/usr/bin/python3`（需要 Python 3.9+），以及 Apple Silicon Homebrew 路径下的
 `swanctl` 和 `charon`。无需启动 `brew services` 中的 strongSwan 服务，App 会管理独立实例。
-已在 strongSwan 6.0.7 上进行本地验证；其他版本需自行验证兼容性。
+历史连接测试使用 strongSwan 6.0.7，但该版本缺少后续安全修复，**新安装应使用 6.1.0 或更新的已修复版本**。
+2026-10-21 已完成 strongSwan 6.1.0 的本地升级和两条现有线路的连接恢复验证，未检测到路由错误。
+升级后仍需验证实际网关兼容性。已有安装可先停止全部 VPN，再运行 `brew update` 和 `brew upgrade strongswan`，
+确认版本后重新启用后台；升级运行中的依赖可能影响连接。
+参见 [官方安全公告](https://www.strongswan.org/security/)。
 参考 [strongSwan macOS 文档](https://docs.strongswan.org/docs/latest/os/macos.html)。
 
 ### 2. 安装 App
@@ -78,6 +82,9 @@ shasum -a 256 -c SHA256SUMS
 后台约每 3 秒检查状态。首次连接失败、隧道被删除或 DPD 判定对端失联后，会按线路自动重试，
 失败重试间隔从 15 秒逐步增加到最多 300 秒。IKEv1 DPD 的失联判断可能需要约 120 秒，
 所以重连并非在物理掉网瞬间发生。明确认证失败会暂停重试，需更正配置后重新连接。
+
+稳定线路每 30 秒完整检查一次路由；虚拟 IP、网段或其他活动线路变化会提前重新检查。
+路由错误不缓存，仍随状态轮询检查。因此代理或路由在连接期间变化时，稳定线路最长可能约 30 秒后修正。
 
 重连前会清除该线路残留的 IKE 会话，包括只有 IKE、尚未安装 CHILD_SA 的半连接，
 避免重复使用已经卡住的会话。清理失败时推迟重试，不会重启其他线路来强制恢复。

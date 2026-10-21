@@ -9,20 +9,31 @@ import re
 import signal
 import socket
 import socketserver
+import stat
 import subprocess
 import tempfile
 import threading
 import time
 
-from strongvpn import ROOT, CHARON, SWANCTL, connection_config, connection_names, daemon_config, write_private, encoded
+from strongvpn import ROOT, CHARON, SWANCTL, connection_config, connection_names, daemon_config, write_private, encoded, safe_environment
 
 
-def atomic_json(path, value):
+def client_file(descriptor, uid):
+    """Only the controlling user and root may read runtime diagnostics."""
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise PermissionError('Unsafe runtime file')
+    os.fchmod(descriptor, 0o600)
+    if os.geteuid() == 0:
+        os.fchown(descriptor, uid, -1)
+
+
+def atomic_json(path, value, uid=None):
     fd, name = tempfile.mkstemp(prefix=path.name + '-', dir=path.parent)
     try:
         with os.fdopen(fd, 'w') as stream:
+            client_file(stream.fileno(), os.getuid() if uid is None else uid)
             json.dump(value, stream, ensure_ascii=False)
-        os.chmod(name, 0o644)
         os.replace(name, path)
     finally:
         if os.path.exists(name):
@@ -136,7 +147,7 @@ class RouteGuard:
         self.active = {}
 
     def run(self, arguments):
-        return self.runner(arguments, capture_output=True, text=True, timeout=5)
+        return self.runner(arguments, capture_output=True, text=True, timeout=5, env=safe_environment())
 
     @staticmethod
     def table(output):
@@ -224,7 +235,7 @@ class EndpointRoutes:
         self.lock = threading.Lock()
 
     def run(self, args):
-        return self.runner(args, capture_output=True, text=True, timeout=5)
+        return self.runner(args, capture_output=True, text=True, timeout=5, env=safe_environment())
 
     def lookup(self, destination):
         response = self.run(['/sbin/route', '-n', 'get', destination])
@@ -289,9 +300,12 @@ class StrongSwanEngine:
         self.vici = runtime / 'backend-charon.vici'
         self.conf = runtime / 'backend-strongswan.conf'
         self.secret_file = runtime / 'backend-swanctl.conf'
-        self.env = dict(os.environ, STRONGSWAN_CONF=str(self.conf))
+        self.env = safe_environment(STRONGSWAN_CONF=str(self.conf))
         self.routes = RouteGuard(logger)
         self.endpoints = EndpointRoutes(logger)
+        self.route_cache = {}
+        self.route_cache_lock = threading.Lock()
+        self.route_check_interval = 30
 
     def healthy(self):
         return self.process is not None and self.process.poll() is None and self.vici.exists()
@@ -355,16 +369,37 @@ class StrongSwanEngine:
         if code:
             raise RuntimeError('Unable to query the VPN tunnel')
         sa = parse_sa(output)
+        # SA health still refreshes every three seconds. Reuse expensive route
+        # scans only while VIPs, selectors, and the set of active peers match.
+        with self.routes.lock:
+            self.routes.active[profile] = sa if sa['installed'] else None
+            fingerprint = tuple(sorted((name, tuple(row['virtual_ips']), tuple(row['remote_subnets']))
+                                       for name, row in self.routes.active.items() if row))
+        with self.route_cache_lock:
+            cached = self.route_cache.get(profile)
+            if not sa['installed']:
+                self.route_cache.pop(profile, None)
+                return sa
+            if cached and cached[0] == fingerprint and time.monotonic() < cached[1]:
+                sa.update(cached[2])
+                return sa
         try:
             if sa['installed'] and self.configs[profile].get('direct_gateway'):
                 self.endpoints.ensure(profile, self.configs[profile]['server'])
-            sa.update(self.routes.check(profile, sa, self.configs[profile]['server']))
+            details = self.routes.check(profile, sa, self.configs[profile]['server'])
         except Exception:
-            sa['route_error'] = 'Cannot verify VPN routes; check the backend log'
+            details = dict(route_error='Cannot verify VPN routes; check the backend log')
+        sa.update(details)
+        # Errors are checked on the next health poll, not cached for 30 seconds.
+        if not details.get('route_error'):
+            with self.route_cache_lock:
+                self.route_cache[profile] = (fingerprint, time.monotonic() + self.route_check_interval, details)
         return sa
 
     def clear_sessions(self, profile):
         """Remove every SA for this profile, including half-negotiated IKE SAs."""
+        with self.route_cache_lock:
+            self.route_cache.pop(profile, None)
         ike, _ = connection_names(profile)
         code, output = self.swan('--list-sas', '--ike', ike, '--raw')
         if code:
@@ -420,6 +455,8 @@ class StrongSwanEngine:
                 self.log(name, 'Unable to clean up a direct gateway route')
         with self.routes.lock:
             self.routes.active.clear()
+        with self.route_cache_lock:
+            self.route_cache.clear()
         for path in (self.secret_file, self.conf, self.vici):
             path.unlink(missing_ok=True)
 
@@ -442,6 +479,7 @@ class Backend:
         self.workers = {}
         self.storage_errors = {}
         self.log_max_bytes = 5 * 1024 * 1024
+        self.client_uid = int(os.environ.get('SUDO_UID', os.getuid()))
         self.states = {name: dict(profile=name, label=cfg['label'], server=cfg['server'],
                                   phase='disconnected', desired=False, generation=0, attempts=0,
                                   handshake_timeout=timeout, auto_reconnect=True,
@@ -467,8 +505,9 @@ class Backend:
                         if previous.exists():
                             os.replace(previous, older)
                         os.replace(path, previous)
-                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644)
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
                     with os.fdopen(fd, 'w') as stream:
+                        client_file(stream.fileno(), self.client_uid)
                         stream.write(line)
                     with self.condition:
                         self.storage_errors.pop(path.name, None)
@@ -490,7 +529,8 @@ class Backend:
                             if ipaddress.ip_network(a).overlaps(ipaddress.ip_network(b)):
                                 overlaps.append(dict(profiles=[left, right], subnets=[a, b]))
             return dict(version=4, pid=os.getpid(), timestamp=time.time(), config_path=self.config_path,
-                        direct_gateway_support=2, reconnect_support=2, config_revision=self.config_revision,
+                        direct_gateway_support=2, reconnect_support=2, hardening_support=1,
+                        config_revision=self.config_revision,
                         storage_error=('Status or log storage is unavailable; VPN control continues in memory'
                                        if self.storage_errors else None),
                         engine_ready=self.engine_ready.is_set(), profiles=profiles, route_overlaps=overlaps,
@@ -499,7 +539,7 @@ class Backend:
     def publish(self):
         with self.publish_lock:
             try:
-                atomic_json(self.status_path, self.snapshot())
+                atomic_json(self.status_path, self.snapshot(), self.client_uid)
             except OSError as error:
                 # Do not log here: the log filesystem may have the same failure.
                 with self.condition:
@@ -513,6 +553,8 @@ class Backend:
             state = self.states[profile]
             if generation is not None and generation != state['generation']:
                 return False
+            if all(state.get(key) == value for key, value in changes.items()):
+                return True
             state.update(changes, updated_at=time.time())
             self.condition.notify_all()
         self.publish()
@@ -553,6 +595,7 @@ class Backend:
 
     def _worker(self, profile):
         delay = self.retry_interval
+        retry_at, retry_generation = 0, None
         while not self.stop_event.is_set():
             with self.condition:
                 state = dict(self.states[profile])
@@ -562,6 +605,13 @@ class Backend:
             if not self.engine_ready.wait(timeout=self.poll_interval):
                 continue
             generation = state['generation']
+            if generation != retry_generation:
+                retry_at, retry_generation = 0, generation
+                delay = self.retry_interval
+            remaining = retry_at - time.monotonic()
+            if remaining > 0:
+                self.stop_event.wait(min(self.poll_interval, remaining))
+                continue
             try:
                 # Only this worker performs operations for this profile. A disconnect
                 # queues cleanup after an in-flight handshake, without touching peers.
@@ -581,7 +631,7 @@ class Backend:
                     self.update(profile, generation, phase='failed', desired=False,
                                 virtual_ips=[], remote_subnets=[], next_retry=0,
                                 error='Tunnel disconnected; automatic reconnect is off')
-                elif time.time() >= state['next_retry']:
+                else:
                     self.update(profile, generation, phase='connecting' if state['attempts'] == 0 else 'reconnecting',
                                 attempts=state['attempts'] + 1)
                     # The second check prevents a queued disconnect from starting a new handshake.
@@ -611,13 +661,12 @@ class Backend:
                             # Retain the physical endpoint pin throughout retries.
                             with self.condition:
                                 retry = self.states[profile]['auto_reconnect']
+                            retry_at = time.monotonic() + delay if retry else 0
                             self.update(profile, generation, phase='reconnecting' if retry else 'failed', desired=retry,
                                         virtual_ips=[], remote_subnets=[], route_error=None, tunnel_interface=None,
                                         error='Tunnel not installed; waiting to retry' if retry else 'Connection failed; automatic reconnect is off',
                                         next_retry=time.time() + delay if retry else 0)
                             delay = min(delay * 2, 300)
-                elif state['phase'] == 'connected':
-                    self.update(profile, generation, phase='reconnecting', virtual_ips=[], remote_subnets=[])
             except Exception as error:
                 self.log(profile, 'Control operation failed: ' + str(error))
                 with self.condition:
@@ -628,6 +677,7 @@ class Backend:
                         self.engine.terminate(profile)
                     except Exception:
                         self.log(profile, 'Session cleanup pending after control failure')
+                retry_at = time.monotonic() + delay
                 self.update(profile, generation,
                             phase=('reconnecting' if retry else 'failed') if current['desired'] else 'disconnecting',
                             desired=retry if current['desired'] else False,
@@ -683,6 +733,21 @@ class Backend:
             self.publish()
 
     def start(self):
+        # Tighten diagnostics created by older versions, including rotated logs.
+        paths = [self.status_path]
+        for pattern in ('strongvpn-*.log', 'strongvpn-*.log.1', 'strongvpn-*.log.2'):
+            paths.extend(self.status_path.parent.glob(pattern))
+        for path in paths:
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                try:
+                    client_file(descriptor, self.client_uid)
+                finally:
+                    os.close(descriptor)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                self.storage_errors[path.name] = error.errno
         self.engine.start()
         self.engine_ready.set()
         for name in self.configs:
@@ -710,9 +775,33 @@ class Backend:
 class ControlServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
 
-    def __init__(self, address, handler, allowed_uid=None):
+    def __init__(self, address, handler, allowed_uid=None, max_clients=16):
         self.allowed_uid = os.getuid() if allowed_uid is None else allowed_uid
+        self.client_slots = threading.BoundedSemaphore(max_clients)
         super().__init__(address, handler)
+
+    def verify_request(self, request, client_address):
+        # Reject other users before allocating a request thread or reading data.
+        try:
+            return peer_uid(request) in (0, self.allowed_uid)
+        except OSError:
+            return False
+
+    def process_request(self, request, client_address):
+        if not self.client_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.client_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.client_slots.release()
 
 
 class ControlHandler(socketserver.StreamRequestHandler):
@@ -725,6 +814,8 @@ class ControlHandler(socketserver.StreamRequestHandler):
             if len(line) > 65536:
                 raise ValueError('Request too large')
             request = json.loads(line)
+            if not isinstance(request, dict):
+                raise ValueError('Request must be an object')
             action = request.get('action')
             backend = self.server.backend
             if action == 'connect':
@@ -746,6 +837,7 @@ class ControlHandler(socketserver.StreamRequestHandler):
 
 
 def serve(config_path, configs, timeout, config_revision=None):
+    os.umask(0o077)
     runtime = runtime_path()
     prepare_runtime(runtime)
     lock_fd = os.open(runtime / 'backend.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -764,9 +856,10 @@ def serve(config_path, configs, timeout, config_revision=None):
         server = ControlServer(str(control), ControlHandler, allowed_uid=int(os.environ.get('SUDO_UID', os.getuid())))
         server.backend = backend
         server.timeout = 0.5
-        # The directory is searchable but not listable. VICI and credential files
-        # stay root-only. Every control request also checks the kernel peer UID.
-        os.chmod(control, 0o666)
+        # Only the controlling user can open the socket. UID checks remain in
+        # place as defense in depth; VICI and credentials remain root-only.
+        os.chown(control, server.allowed_uid, -1)
+        os.chmod(control, 0o600)
         os.chmod(runtime, 0o711)
         while not backend.stop_event.is_set():
             server.handle_request()
@@ -808,8 +901,9 @@ def ensure_backend(config_path, timeout):
                 raise RuntimeError('The old single-VPN process is still running. Press Ctrl+C in its terminal once, then retry the new command')
         finally:
             os.close(legacy)
-        process = subprocess.Popen(['/usr/bin/python3', str(ROOT / 'strongvpn.py'), '_serve',
+        process = subprocess.Popen(['/usr/bin/python3', '-B', '-E', '-s', str(ROOT / 'strongvpn.py'), '_serve',
                                     '--config', str(Path(config_path).resolve()), '--timeout', str(timeout)],
+                                   env=safe_environment(),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, start_new_session=True)
         deadline = time.monotonic() + 25

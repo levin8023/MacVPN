@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.3
+
+- Restrict runtime status, logs, and the control socket to the controlling user; keep VICI root-only.
+- Authenticate local requests before creating threads and cap concurrent control handlers.
+- Honor exponential backoff on control failures using monotonic deadlines.
+- Cache successful route checks for 30 seconds while polling SA health every 3 seconds.
+- Avoid unchanged status writes, redundant preference writes, and idle Python status subprocesses.
+- Sanitize child-process environments and disable Python environment/user-site overrides.
+- Build fresh bundles and validate every release file against an explicit allowlist.
+- Document strongSwan 6.1.0+ as the security baseline and verify two concurrent connections with 6.1.0.
+- Retain plaintext local credential storage and the existing administrator bootstrap in this preview.
+
 ## 0.2.2
 
 - Restore the menu panel to its pre-edit position after Save, Cancel, or the window close button.

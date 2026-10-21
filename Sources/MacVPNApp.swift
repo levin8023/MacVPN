@@ -36,6 +36,7 @@ struct BackendStatus: Decodable {
     var reconnect_support: Int? = nil
     var storage_error: String? = nil
     var config_revision: String? = nil
+    var hardening_support: Int? = nil
 }
 
 struct BridgeResponse: Decodable { let state: BackendStatus }
@@ -54,7 +55,9 @@ enum Bridge {
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.currentDirectoryURL = URL(fileURLWithPath: "/private/tmp")
-        process.environment = ProcessInfo.processInfo.environment.merging(["PYTHONDONTWRITEBYTECODE": "1"]) { _, new in new }
+        process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
+                               "HOME": FileManager.default.homeDirectoryForCurrentUser.path,
+                               "LANG": "en_US.UTF-8", "PYTHONDONTWRITEBYTECODE": "1"]
         let output = Pipe()
         process.standardOutput = output
         process.standardError = output
@@ -74,7 +77,7 @@ enum Bridge {
     }
 
     static func request(_ action: String, profile: String? = nil, enabled: Bool? = nil) throws -> BackendStatus {
-        var arguments = [resources.appendingPathComponent("app_bridge.py").path, "request", action]
+        var arguments = ["-B", "-E", "-s", resources.appendingPathComponent("app_bridge.py").path, "request", action]
         if let profile { arguments.append(profile) }
         if let enabled { arguments.append(enabled ? "true" : "false") }
         let data = try run("/usr/bin/python3", arguments)
@@ -104,7 +107,7 @@ enum Bridge {
         try manager.copyItem(at: config, to: snapshot)
         try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: snapshot.path)
         let command = "/usr/bin/env SUDO_UID=\(getuid()) PYTHONDONTWRITEBYTECODE=1 MACVPN_CONFIG_ORIGIN=" + shellQuote(config.path)
-            + " /usr/bin/python3 " + shellQuote(stage.appendingPathComponent("app_bridge.py").path)
+            + " /usr/bin/python3 -B -E -s " + shellQuote(stage.appendingPathComponent("app_bridge.py").path)
             + " bootstrap " + shellQuote(snapshot.path)
         let script = "do shell script " + appleQuote(command) + " with administrator privileges\n"
         let data = try run("/usr/bin/osascript", ["-"], input: script)
@@ -151,7 +154,7 @@ final class VPNModel: ObservableObject {
                     "office-primary": VPNStatus(phase: "disconnected", desired: false, auto_reconnect: true, virtual_ips: [], remote_subnets: [], next_retry: 0),
                     "office-backup": VPNStatus(phase: "connected", desired: true, auto_reconnect: true, virtual_ips: ["10.20.0.2"], remote_subnets: ["10.30.0.0/24"], next_retry: 0),
                     "partner": VPNStatus(phase: "reconnecting", desired: true, auto_reconnect: true, virtual_ips: [], remote_subnets: [], next_retry: Date().timeIntervalSince1970 + 28)
-                ], route_overlaps: [], reconnect_support: 2)
+                ], route_overlaps: [], reconnect_support: 2, hardening_support: 1)
         } else {
             refresh()
             timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -163,7 +166,9 @@ final class VPNModel: ObservableObject {
     var fresh: Bool { state.map { now.timeIntervalSince1970 - $0.timestamp < 20 } ?? false }
     var stopping: Bool { fresh && state?.stopping == true }
     var backendAvailable: Bool { fresh && !stopping && state?.version == 4 && state?.engine_ready == true && (state?.reconnect_support ?? 0) >= 2 && state?.config_path == configURL.path }
-    var configurationPending: Bool { backendAvailable && state?.config_revision != document.revision }
+    var configurationPending: Bool {
+        backendAvailable && (state?.config_revision != document.revision || (state?.hardening_support ?? 0) < 1)
+    }
     var ready: Bool { backendAvailable && !configurationPending }
     var activeCount: Int { backendAvailable ? state?.profiles.values.filter { $0.phase == "connected" }.count ?? 0 : 0 }
     var working: Bool { backendAvailable && state?.profiles.values.contains { ["connecting", "reconnecting", "disconnecting"].contains($0.phase) } == true }
@@ -259,7 +264,8 @@ final class VPNModel: ObservableObject {
            let value = try? JSONDecoder().decode(BackendStatus.self, from: data),
            state == nil || value.timestamp >= (state?.timestamp ?? 0) { state = value }
         // A full/unwritable disk must not leave the UI stuck on the cached state.
-        if (state == nil || now.timeIntervalSince1970 - (state?.timestamp ?? 0) > 6), !refreshingLiveStatus {
+        if (state == nil || now.timeIntervalSince1970 - (state?.timestamp ?? 0) > 6), !refreshingLiveStatus,
+           FileManager.default.fileExists(atPath: Bridge.runtime.appendingPathComponent("control.sock").path) {
             refreshingLiveStatus = true
             Task {
                 if let live = try? await Task.detached(priority: .utility, operation: {
@@ -270,7 +276,7 @@ final class VPNModel: ObservableObject {
         }
         if ready, !busy, let rows = state?.profiles {
             for (name, row) in rows {
-                if let enabled = row.auto_reconnect {
+                if let enabled = row.auto_reconnect, preferences[name] != enabled {
                     preferences[name] = enabled
                     UserDefaults.standard.set(enabled, forKey: "reconnect.\(name)")
                 }

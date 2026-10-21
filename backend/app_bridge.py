@@ -39,6 +39,7 @@ def main():
     if existing and (existing.get('version', 0) < 4 or
                      existing.get('direct_gateway_support', 0) < 2 or
                      existing.get('reconnect_support', 0) < 2 or
+                     existing.get('hardening_support', 0) < 1 or
                      existing.get('config_path') != origin or
                      existing.get('config_revision') != config.get('revision')):
         for name, row in existing['profiles'].items():

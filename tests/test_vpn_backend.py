@@ -4,7 +4,10 @@ import errno
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
+import socket
+import stat
 import tempfile
 import threading
 import time
@@ -12,8 +15,8 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 
-from strongvpn import connection_config, connection_names
-from vpn_backend import Backend, ControlHandler, ControlServer, EndpointRoutes, RouteGuard, StrongSwanEngine, parse_sa, rpc, wait_backend_stopped
+from strongvpn import connection_config, connection_names, safe_environment
+from vpn_backend import Backend, ControlHandler, ControlServer, EndpointRoutes, RouteGuard, StrongSwanEngine, atomic_json, parse_sa, rpc, wait_backend_stopped
 
 
 def configurations():
@@ -327,10 +330,90 @@ class BackendTests(unittest.TestCase):
         thread.start()
         try:
             with patch('vpn_backend.peer_uid', return_value=999999):
-                with self.assertRaises(RuntimeError):
+                with self.assertRaises((RuntimeError, OSError)):
                     rpc(self.root, dict(action='connect', profile='one'))
             self.assertEqual(self.engine.calls, [])
         finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_control_error_obeys_backoff_while_other_profile_stays_connected(self):
+        self.backend.retry_interval = 0.3
+        self.backend.connect('two')
+        self.wait_for(lambda: self.phase('two') == 'connected')
+        original = self.engine.status
+        calls = []
+
+        def status(profile):
+            if profile == 'one':
+                calls.append(time.monotonic())
+                raise TimeoutError('Synthetic control timeout')
+            return original(profile)
+
+        self.engine.status = status
+        self.backend.connect('one')
+        self.wait_for(lambda: len(calls) >= 3)
+        self.assertGreaterEqual(calls[1] - calls[0], 0.28)
+        self.assertGreaterEqual(calls[2] - calls[1], 0.58)
+        self.assertEqual(self.phase('two'), 'connected')
+        self.assertEqual(self.engine.calls.count('two'), 1)
+
+    def test_unchanged_connected_state_does_not_rewrite_cache(self):
+        self.backend.connect('one')
+        self.wait_for(lambda: self.phase('one') == 'connected')
+        with patch.object(self.backend, 'publish') as publish:
+            row = self.backend.snapshot()['profiles']['one']
+            self.backend.update('one', phase=row['phase'], virtual_ips=row['virtual_ips'])
+            publish.assert_not_called()
+
+    def test_runtime_diagnostics_are_private_including_old_rotations(self):
+        other_root = self.root / 'private-runtime'
+        other_root.mkdir()
+        for name in ('status.json', 'strongvpn-backend.log.2', 'strongvpn-one.log.1', 'strongvpn-deleted.log'):
+            path = other_root / name
+            path.write_text('{}')
+            path.chmod(0o644)
+        backend = Backend(configurations(), other_root, other_root / 'status.json',
+                          other_root / 'config.json', engine=FakeEngine(), poll_interval=0.02)
+        try:
+            backend.start()
+            backend.log('one', 'Synthetic diagnostic')
+            for path in other_root.iterdir():
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        finally:
+            backend.stop()
+
+    def test_control_socket_bounds_slow_clients_and_recovers_slots(self):
+        server = ControlServer(str(self.root / 'bounded.sock'), ControlHandler, max_clients=2)
+        server.backend = self.backend
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01})
+        thread.start()
+        clients = []
+        try:
+            for _ in range(2):
+                client = socket.socket(socket.AF_UNIX)
+                client.settimeout(1)
+                client.connect(str(self.root / 'bounded.sock'))
+                client.sendall(b'{')
+                clients.append(client)
+            self.wait_for(lambda: server.client_slots._value == 0)
+            with socket.socket(socket.AF_UNIX) as extra:
+                extra.settimeout(1)
+                extra.connect(str(self.root / 'bounded.sock'))
+                try:
+                    self.assertEqual(extra.recv(1), b'')
+                except ConnectionResetError:
+                    pass
+            for client in clients:
+                client.sendall(b'}\n')
+                self.assertIn(b'"ok": false', client.recv(8192))
+            self.wait_for(lambda: server.client_slots._value == 2)
+            # A malformed document must not damage the server or its backend.
+            self.assertFalse(self.backend.stop_event.is_set())
+        finally:
+            for client in clients:
+                client.close()
             server.shutdown()
             server.server_close()
             thread.join()
@@ -448,6 +531,44 @@ class RouteTests(unittest.TestCase):
 
 
 class SessionCleanupTests(unittest.TestCase):
+    def test_route_scans_are_cached_but_sa_health_is_always_queried(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = StrongSwanEngine(configurations(), Path(directory), lambda *args: None)
+            raw = ['state=ESTABLISHED local-vips=[ 10.20.0.1 ] '
+                   'state=INSTALLED remote-ts=[ 10.30.0.0/24 ]']
+            engine.swan = lambda *args, **kwargs: (0, raw[0])
+            with patch.object(engine.routes, 'check', return_value={'route_error': None}) as check:
+                for _ in range(10):
+                    self.assertTrue(engine.status('one')['installed'])
+                self.assertEqual(check.call_count, 1)
+                # VIP changes trigger an immediate route scan.
+                raw[0] = raw[0].replace('10.20.0.1', '10.20.0.2')
+                engine.status('one')
+                self.assertEqual(check.call_count, 2)
+                # Expiration triggers a scan even if the SA is unchanged.
+                with patch('vpn_backend.time.monotonic', return_value=time.monotonic() + 31):
+                    engine.status('one')
+                self.assertEqual(check.call_count, 3)
+                # A dropped tunnel invalidates the cache before reconnection.
+                connected = raw[0]
+                raw[0] = ''
+                self.assertFalse(engine.status('one')['installed'])
+                raw[0] = connected
+                engine.status('one')
+                self.assertEqual(check.call_count, 4)
+
+    def test_route_errors_and_peer_overlap_changes_are_not_hidden_by_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = StrongSwanEngine(configurations(), Path(directory), lambda *args: None)
+            engine.swan = lambda *args, **kwargs: (0, 'state=ESTABLISHED local-vips=[ 10.20.0.1 ] '
+                                                 'state=INSTALLED remote-ts=[ 10.30.0.0/24 ]')
+            with patch.object(engine.routes, 'check', return_value={'route_error': 'Synthetic route error'}) as check:
+                engine.status('one'); engine.status('one')
+                self.assertEqual(check.call_count, 2)
+            with patch.object(engine.routes, 'check', return_value={'route_error': None}) as check:
+                engine.status('one'); engine.status('two'); engine.status('one')
+                self.assertEqual(check.call_count, 3)
+
     def test_half_connected_ike_is_forced_out_before_new_handshake(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = StrongSwanEngine(configurations(), Path(directory), lambda *args: None)
@@ -501,6 +622,24 @@ class SessionCleanupTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_privileged_children_do_not_inherit_injection_environment(self):
+        with patch.dict(os.environ, {'PYTHONPATH': '/untrusted', 'PYTHONHOME': '/untrusted',
+                                     'OPENSSL_CONF': '/untrusted', 'DYLD_INSERT_LIBRARIES': '/untrusted',
+                                     'STRONGSWAN_CONF': '/untrusted', 'SUDO_UID': str(os.getuid())}):
+            env = safe_environment(STRONGSWAN_CONF='/trusted/runtime.conf')
+        self.assertEqual(env['STRONGSWAN_CONF'], '/trusted/runtime.conf')
+        self.assertEqual(env['SUDO_UID'], str(os.getuid()))
+        for name in ('PYTHONPATH', 'PYTHONHOME', 'OPENSSL_CONF', 'DYLD_INSERT_LIBRARIES'):
+            self.assertNotIn(name, env)
+
+    def test_atomic_status_file_is_not_world_readable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'status.json'
+            path.write_text('{}'); path.chmod(0o644)
+            atomic_json(path, {'ok': True})
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(json.loads(path.read_text()), {'ok': True})
+
     def test_raw_status_requires_ike_and_child_and_extracts_routes(self):
         value = parse_sa('list-sa { vpn { state=ESTABLISHED local-vips=[ 10.20.0.1 ] '
                          'child-sas { child { state=INSTALLED remote-ts=[ 10.30.0.0/24 10.31.0.0/24 ] } } } }')
@@ -520,8 +659,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_configuration_reload_uses_revision_and_preserves_only_retained_profiles(self):
         import app_bridge
-        for existing_revision in ('previous', 'current'):
-            with self.subTest(existing_revision=existing_revision), tempfile.TemporaryDirectory() as directory:
+        for existing_revision, hardening in (('previous', 1), ('current', 1), ('current', 0)):
+            with self.subTest(existing_revision=existing_revision, hardening=hardening), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 config_path = root / 'profiles.json'
                 config_path.write_text(json.dumps({'revision': 'current', 'profiles': {
@@ -530,7 +669,7 @@ class ConfigTests(unittest.TestCase):
                 calls = []
                 def fake_rpc(runtime, request, **kwargs):
                     calls.append(request)
-                    return dict(state=dict(version=4, direct_gateway_support=2, reconnect_support=2,
+                    return dict(state=dict(version=4, direct_gateway_support=2, reconnect_support=2, hardening_support=hardening,
                                            config_path=str(config_path.resolve()), config_revision=existing_revision,
                                            profiles={'one': {'desired': True, 'auto_reconnect': False},
                                                      'deleted': {'desired': True}}))
@@ -543,7 +682,7 @@ class ConfigTests(unittest.TestCase):
                      patch('app_bridge.ensure_backend', return_value=root), \
                      contextlib.redirect_stdout(io.StringIO()) as output:
                     app_bridge.main()
-                if existing_revision == 'previous':
+                if existing_revision == 'previous' or hardening == 0:
                     self.assertIn(dict(action='shutdown'), calls)
                     self.assertIn(dict(action='connect', profile='one', auto_reconnect=False), calls)
                 else:

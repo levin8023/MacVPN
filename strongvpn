@@ -3,7 +3,7 @@ set -eu
 TASK_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 case "${1:-}" in
 run|test|connect|disconnect|shutdown)
-    exec /usr/bin/sudo /usr/bin/python3 "$TASK_ROOT/backend/strongvpn.py" "$@"
+    exec /usr/bin/sudo /usr/bin/python3 -B -E -s "$TASK_ROOT/backend/strongvpn.py" "$@"
     ;;
 esac
-exec /usr/bin/python3 "$TASK_ROOT/backend/strongvpn.py" "$@"
+exec /usr/bin/python3 -B -E -s "$TASK_ROOT/backend/strongvpn.py" "$@"

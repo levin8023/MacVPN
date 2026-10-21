@@ -2,9 +2,13 @@
 set -eu
 TASK_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$TASK_ROOT"
-APP="$TASK_ROOT/build/MacVPN.app"
 VERSION=$(cat VERSION)
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$TASK_ROOT/.build/module-cache"
+mkdir -p "$TASK_ROOT/.build/module-cache" "$TASK_ROOT/build"
+# Never reuse a bundle that may contain stale resources or local files.
+STAGE=$(mktemp -d "$TASK_ROOT/.build/app.XXXXXX")
+trap 'rm -rf "$STAGE"' EXIT HUP INT TERM
+APP="$STAGE/MacVPN.app"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 xcrun swiftc -O -parse-as-library -swift-version 5 -module-cache-path "$TASK_ROOT/.build/module-cache" \
   -debug-prefix-map "$TASK_ROOT"=. -file-prefix-map "$TASK_ROOT"=. \
   -target arm64-apple-macosx13.0 Sources/*.swift -o "$APP/Contents/MacOS/MacVPN"
@@ -22,4 +26,6 @@ with open(sys.argv[1], 'wb') as stream:
 PY
 /usr/bin/codesign --force --sign - "$APP"
 /usr/bin/codesign --verify --strict "$APP"
-printf '%s\n' "$APP"
+rm -rf "$TASK_ROOT/build/MacVPN.app"
+mv "$APP" "$TASK_ROOT/build/MacVPN.app"
+printf '%s\n' "$TASK_ROOT/build/MacVPN.app"

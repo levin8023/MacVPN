@@ -4,10 +4,21 @@ import base64
 import json
 from pathlib import Path
 import plistlib
+import stat
 import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+ALLOWED_FILES = {'MacVPN/' + name for name in ('README.md', 'LICENSE', 'CHANGELOG.md')}
+ALLOWED_FILES.update('MacVPN/MacVPN.app/Contents/' + name for name in (
+    'Info.plist', 'MacOS/MacVPN', '_CodeSignature/CodeResources',
+    'Resources/strongvpn.py', 'Resources/vpn_backend.py', 'Resources/app_bridge.py'))
+
+
+def allowed_entry(name, is_directory=False):
+    if is_directory:
+        return name.endswith('/') and any(path.startswith(name) for path in ALLOWED_FILES)
+    return name in ALLOWED_FILES
 
 
 def verify(archive):
@@ -28,12 +39,11 @@ def verify(archive):
                 if value:
                     private.append(('0s' + base64.b64encode(value.encode()).decode()).encode().lower())
     failures = []
-    allowed = {'MacVPN.app', 'README.md', 'LICENSE', 'CHANGELOG.md'}
     with zipfile.ZipFile(archive) as bundle:
         for item in bundle.infolist():
             path = Path(item.filename)
-            if (not path.parts or path.parts[0] != 'MacVPN' or '..' in path.parts or
-                (len(path.parts) > 1 and path.parts[1] not in allowed)):
+            if (not allowed_entry(item.filename, item.is_dir()) or
+                stat.S_ISLNK(item.external_attr >> 16)):
                 failures.append(item.filename)
                 continue
             if item.is_dir():

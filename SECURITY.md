@@ -8,4 +8,15 @@ The client manages privileged network processes and supports legacy IKEv1 gatewa
 Only use configurations and binaries you trust. Do not disable macOS security protections to run an unknown build.
 Credentials are stored in an app-managed JSON file under Application Support, with mode 600. It is plaintext local storage, not a keychain or an encrypted vault.
 
+Use a maintained strongSwan release with current security fixes (at least 6.1.0 as of 2026-10-21).
+See the [upstream advisories](https://www.strongswan.org/security/). Updating MacVPN alone does not update Homebrew dependencies.
+IKEv1 Aggressive Mode with PSK, SHA-1, DH group 2, and optional 3DES fallback are legacy gateway compatibility choices,
+not modern cryptographic defaults. Prefer migrating the gateway to IKEv2 with strong authentication.
+
+The preview authorizes a staged Python backend and trusts Homebrew executables/plugins owned by the local user.
+It does not provide a signed, immutable privileged-helper boundary or verify client code signatures.
+Any process running as the controlling user can issue the documented VPN control operations and read that user's saved credentials.
+For wider distribution, migrate to a signed helper with authenticated IPC, protect the executable dependency chain,
+and add Developer ID signing and notarization. See the [2026-10-21 review](docs/security-review-2026-10-21.md).
+
 No supported-release security response SLA is currently provided. This is preview software.

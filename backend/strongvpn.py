@@ -13,6 +13,21 @@ import time
 ROOT = Path(__file__).resolve().parent
 SWANCTL = Path('/opt/homebrew/bin/swanctl')
 CHARON = Path('/opt/homebrew/opt/strongswan/libexec/ipsec/charon')
+
+
+def safe_environment(**extra):
+    # Do not inherit Python, dynamic-loader, OpenSSL, or plugin search overrides
+    # into privileged child processes.
+    env = dict(PATH='/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin',
+               HOME=pwd.getpwuid(os.geteuid()).pw_dir, LANG='en_US.UTF-8',
+               PYTHONDONTWRITEBYTECODE='1', PYTHONNOUSERSITE='1')
+    for key in ('SUDO_UID', 'MACVPN_CONFIG_ORIGIN'):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    env.update(extra)
+    return env
+
+
 def connection_names(profile):
     return 'macvpn-' + profile, 'macvpn-' + profile + '-net'
 
