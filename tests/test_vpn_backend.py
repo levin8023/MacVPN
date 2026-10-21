@@ -518,35 +518,47 @@ class ConfigTests(unittest.TestCase):
             self.assertIn('ike-' + name + ' {', text)
             self.assertIn('xauth-' + name + ' {', text)
 
-    def test_app_upgrade_without_reconnect_support_restores_requested_profile_through_alias(self):
+    def test_configuration_reload_uses_revision_and_preserves_only_retained_profiles(self):
         import app_bridge
+        for existing_revision in ('previous', 'current'):
+            with self.subTest(existing_revision=existing_revision), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config_path = root / 'profiles.json'
+                config_path.write_text(json.dumps({'revision': 'current', 'profiles': {
+                    'one': dict(label='One', server='192.0.2.1', group='test', username='test-user',
+                                password='test-password', shared_secret='test-psk')}}))
+                calls = []
+                def fake_rpc(runtime, request, **kwargs):
+                    calls.append(request)
+                    return dict(state=dict(version=4, direct_gateway_support=2, reconnect_support=2,
+                                           config_path=str(config_path.resolve()), config_revision=existing_revision,
+                                           profiles={'one': {'desired': True, 'auto_reconnect': False},
+                                                     'deleted': {'desired': True}}))
+                with patch('sys.argv', ['app_bridge.py', 'bootstrap', str(config_path)]), \
+                     patch('app_bridge.os.geteuid', return_value=0), \
+                     patch('app_bridge.os.environ', {}), \
+                     patch('app_bridge.runtime_path', return_value=root), \
+                     patch('app_bridge.rpc', side_effect=fake_rpc), \
+                     patch('app_bridge.wait_backend_stopped'), \
+                     patch('app_bridge.ensure_backend', return_value=root), \
+                     contextlib.redirect_stdout(io.StringIO()) as output:
+                    app_bridge.main()
+                if existing_revision == 'previous':
+                    self.assertIn(dict(action='shutdown'), calls)
+                    self.assertIn(dict(action='connect', profile='one', auto_reconnect=False), calls)
+                else:
+                    self.assertFalse(any(call['action'] != 'status' for call in calls))
+                self.assertFalse(any(call.get('profile') == 'deleted' for call in calls))
+                self.assertNotIn('test-password', output.getvalue())
+
+    def test_empty_managed_configuration_is_valid_but_cannot_connect(self):
+        from strongvpn import read_config, settings
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config_path = root / 'config.json'
-            config_path.write_text(json.dumps({'profiles': {
-                'one': dict(label='One', server='192.0.2.1', group='test', username='test-user',
-                            password='test-password', shared_secret='test-psk', aliases=['old-one'])}}))
-            calls = []
-
-            def fake_rpc(runtime, request, **kwargs):
-                calls.append(request)
-                if len(calls) == 1:
-                    return dict(state=dict(version=4, direct_gateway_support=2, reconnect_support=1, profiles={'old-one': {'desired': True},
-                                                               'other': {'desired': False}}))
-                return dict(state=dict(version=3, profiles={}))
-
-            with patch('sys.argv', ['app_bridge.py', 'bootstrap', str(config_path)]), \
-                 patch('app_bridge.os.geteuid', return_value=0), \
-                 patch('app_bridge.runtime_path', return_value=root), \
-                 patch('app_bridge.rpc', side_effect=fake_rpc), \
-                 patch('app_bridge.wait_backend_stopped') as stopped, \
-                 patch('app_bridge.ensure_backend', return_value=root), \
-                 contextlib.redirect_stdout(io.StringIO()) as output:
-                app_bridge.main()
-            stopped.assert_called_once_with(root)
-            self.assertIn(dict(action='shutdown'), calls)
-            self.assertIn(dict(action='connect', profile='one'), calls)
-            self.assertNotIn('test-password', output.getvalue())
+            path = Path(directory) / 'profiles.json'
+            path.write_text('{"profiles": {}}')
+            self.assertEqual(read_config(path)['profiles'], {})
+            with self.assertRaisesRegex(ValueError, 'add one'):
+                settings(path)
 
 
 if __name__ == '__main__':

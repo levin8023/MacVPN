@@ -426,9 +426,10 @@ class StrongSwanEngine:
 
 class Backend:
     def __init__(self, configs, runtime, status_path, config_path, timeout=45, engine=None,
-                 poll_interval=3, retry_interval=15):
+                 poll_interval=3, retry_interval=15, config_revision=None):
         self.configs, self.runtime = configs, runtime
         self.status_path, self.config_path = status_path, str(config_path)
+        self.config_revision = config_revision
         self.timeout, self.poll_interval, self.retry_interval = timeout, poll_interval, retry_interval
         self.condition = threading.Condition(threading.RLock())
         self.stop_event = threading.Event()
@@ -489,7 +490,7 @@ class Backend:
                             if ipaddress.ip_network(a).overlaps(ipaddress.ip_network(b)):
                                 overlaps.append(dict(profiles=[left, right], subnets=[a, b]))
             return dict(version=4, pid=os.getpid(), timestamp=time.time(), config_path=self.config_path,
-                        direct_gateway_support=2, reconnect_support=2,
+                        direct_gateway_support=2, reconnect_support=2, config_revision=self.config_revision,
                         storage_error=('Status or log storage is unavailable; VPN control continues in memory'
                                        if self.storage_errors else None),
                         engine_ready=self.engine_ready.is_set(), profiles=profiles, route_overlaps=overlaps,
@@ -744,7 +745,7 @@ class ControlHandler(socketserver.StreamRequestHandler):
         self.wfile.write(json.dumps(response).encode() + b'\n')
 
 
-def serve(config_path, configs, timeout):
+def serve(config_path, configs, timeout, config_revision=None):
     runtime = runtime_path()
     prepare_runtime(runtime)
     lock_fd = os.open(runtime / 'backend.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -752,7 +753,7 @@ def serve(config_path, configs, timeout):
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise RuntimeError('VPN backend is already running')
-    backend = Backend(configs, runtime, runtime / 'status.json', config_path, timeout)
+    backend = Backend(configs, runtime, runtime / 'status.json', config_path, timeout, config_revision=config_revision)
     server = None
     signal.signal(signal.SIGTERM, lambda *_: backend.stop_event.set())
     signal.signal(signal.SIGINT, lambda *_: backend.stop_event.set())

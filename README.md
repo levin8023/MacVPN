@@ -3,7 +3,7 @@
 轻量的 macOS 菜单栏 VPN 客户端，通过本机 strongSwan 管理 Cisco IPSec（IKEv1 PSK + XAuth）连接。
 提供连接状态、多线路并发、按线路断开、自动重连和路由检查。
 
-当前为 **0.1.1 预览版**，支持 Apple Silicon。它适用于已有的兼容 VPN 网关，不包含 VPN 服务端。
+当前为 **0.2.0 预览版**，支持 Apple Silicon。它适用于已有的兼容 VPN 网关，不包含 VPN 服务端。
 
 ## 安装
 
@@ -46,64 +46,32 @@ shasum -a 256 -c SHA256SUMS
 [Apple 官方说明](https://support.apple.com/guide/mac-help/open-an-app-by-overriding-security-settings-mh40617/mac)
 在“系统设置 → 隐私与安全性”中允许打开。无需关闭系统安全保护。
 
-### 3. 准备自己的配置
+### 3. 在 App 中添加 VPN
 
-从发布包复制 `config.example.json`：
+1. 启动 App，点击“新增 VPN”或右上角的加号。
+2. 填写名称、服务器 IP 或域名、账号、登录密码、群组名称和 IPSec 共享密钥。
+3. 点击“保存”，返回线路列表后点击“连接”。首次连接会请求 macOS 管理员授权。
+4. 按需开启各线路的“自动重连”。多条线路可同时连接。
 
-```sh
-mkdir -p "$HOME/Library/Application Support/MacVPN"
-cp -n config.example.json "$HOME/Library/Application Support/MacVPN/config.local.json"
-chmod 600 "$HOME/Library/Application Support/MacVPN/config.local.json"
-```
+无需创建、选择或编辑 JSON 文件。密码与共享密钥在表单中默认隐藏，配置由 App 自动保存到
+`~/Library/Application Support/MacVPN/profiles.json`，文件权限为 `600`，目录权限为 `700`。
+这是本地明文存储，不读取钥匙串，不上传认证信息。
 
-编辑 `config.local.json`，把示例服务器替换成实际地址，并填写管理员提供的认证信息。
-示例地址属于文档专用地址，不能用于实际连接；示例中的空认证字段必须填写。
+**0.2.0 从空配置开始，不读取、导入或迁移旧版本的外部配置。** 请在界面重新添加线路。
+若旧后台仍在运行，首次启用新版配置会停止旧后台及其连接；只打开新版界面不会断开它们。
 
-```json
-{
-  "schema_version": 1,
-  "default_profile": "office-primary",
-  "profiles": {
-    "office-primary": {
-      "label": "Primary VPN",
-      "server": "192.0.2.10",
-      "group": "YOUR_GROUP",
-      "username": "YOUR_USERNAME",
-      "password": "YOUR_PASSWORD",
-      "shared_secret": "YOUR_PSK",
-      "direct_gateway": false
-    }
-  }
-}
-```
+### 4. 编辑与删除
 
-| 字段 | 含义 |
-| --- | --- |
-| `profiles` 的键 | 线路标识，仅支持英文字母、数字、下划线和连字符 |
-| `label` | 界面显示名称 |
-| `server` | VPN 网关地址；使用 `direct_gateway` 时必须是 IPv4 地址 |
-| `group` | Cisco IPSec 群组名称 |
-| `username` / `password` | XAuth 登录账号、密码 |
-| `shared_secret` | IPSec 共享密钥（PSK），与登录密码不同 |
-| `direct_gateway` | 可选，默认 `false`；让该 VPN 网关通过物理默认网关直连，避免被其他 TUN 代理接管 |
-| `aliases` / `service` | 可选，兼容旧线路名称的 CLI 别名 |
-
-可删除不需要的线路，或按同样结构添加线路，并相应修改 `default_profile`。
-认证信息只从选择的 JSON 读取，不读取 AppleScript 文件或钥匙串。
-JSON 明文保存凭据，应仅允许自己的账号访问，不得随源码、日志或安装包共享。
-
-### 4. 开始连接
-
-1. 启动 App，从菜单栏图标打开面板。
-2. 选择自己的 `config.local.json`，点击“启用后台”并完成系统管理员授权。
-3. 点击各线路的“连接”。多条线路可同时连接；断开按钮只影响该线路。
-4. 按需打开各线路的“自动重连”。主动断开后不会自动重新连接。
+- 点击线路上的“…”菜单，选择“编辑”或“删除”。
+- 保存修改后，当前连接继续运行。点击“应用更改并恢复连接”，会重新加载配置并恢复仍保留的连接请求。
+- 删除已连接的线路会先断开该线路，其他线路继续运行。删除最后一条线路后停止空后台。
+- 删除最后一条线路后，可以直接从空状态继续新增，无需重建任何文件。
+- 服务器直连选项位于编辑表单的“高级选项”，仅支持 IPv4 地址。
 
 左键菜单栏图标打开或隐藏面板；右键菜单提供打开和退出；面板支持关闭按钮、Esc 和 ⌘W。
-退出界面不会停止后台已有连接；需要停止全部连接时，使用界面菜单中的停止后台操作。
-登录启动选项只负责启动界面；重启电脑后，需再次授权启用后台。
-
-修改配置后需停止并重新启用后台以加载新内容。后台升级也可能短暂断开并恢复已请求的连接。
+编辑表单是独立窗口，切换到其他应用或关闭菜单面板不会关闭表单。
+退出界面不会停止后台连接；停止全部连接请使用界面菜单中的停止后台操作。
+登录启动选项只启动界面；重启电脑后需要再次授权启用后台。
 
 ## 自动重连与网络问题
 
@@ -124,26 +92,23 @@ App 会校验内网路由的隧道接口；无法确认或发现多个 VPN 网�
 多个 VPN 使用相同网段时不提供自动策略路由隔离。
 
 如果另一个代理 App 使用 TUN 模式，导致连接初期卡顿、握手反复超时或频繁掉线，
-可仅为受影响线路设置 `"direct_gateway": true`，再重启后台。
+可在受影响线路的“高级选项”中开启“VPN 服务器直连”，保存并应用更改。
 该选项只维护目标 VPN 网关的 `/32` 物理出口路由，不会关闭其他代理或修改默认路由；
 不适用于必须经过代理才能访问的 VPN 网关。断开线路会清理本程序创建的路由。
 
 ## 命令行
 
-克隆源码后，在项目根目录运行。默认读取根目录下未被 Git 跟踪的 `config.local.json`；
-也可用 `--config` 指定外部文件。
+命令行默认使用 App 保存的配置。先在界面添加线路，再运行 `profiles` 获取自动生成的线路标识：
 
 ```sh
 ./strongvpn profiles
-./strongvpn check --profile office-primary
-./strongvpn connect --profile office-primary
-./strongvpn connect --profile partner
 ./strongvpn status --json
-./strongvpn disconnect --profile office-primary
+./strongvpn connect --profile YOUR_PROFILE_ID
+./strongvpn disconnect --profile YOUR_PROFILE_ID
 ./strongvpn shutdown
 ```
 
-`connect` 把连接交给后台管理，终端关闭后继续运行；`run --profile office-primary`
+`connect` 把连接交给后台管理，终端关闭后继续运行；`run --profile YOUR_PROFILE_ID`
 会保持前台状态输出，Ctrl+C 只断开所选线路。管理隧道的命令通过 `sudo` 获得权限，
 `profiles`、`check`、`status` 无需管理员权限。不要同时运行其他手工启动的 charon 实例。
 
@@ -166,14 +131,13 @@ backend/                 Python 控制层与 strongSwan 后台
 scripts/                 构建、测试、发布打包
 tests/                  离线回归测试
 .github/workflows/       CI 与标签发布工作流
-config.example.json      不含真实认证信息的模板
 build/                   本地 App，忽略提交
 dist/                    Release 安装包及校验文件，忽略提交
 ```
 
 发布前修改 `VERSION` 和 `CHANGELOG.md`，推送对应的 `v<版本>` 标签。
 GitHub Actions 会运行测试、构建 App，并上传预发布版本和 SHA-256 校验文件。
-Release 只包含 App、说明文档、模板和许可证；strongSwan 由使用者独立安装。
+Release 只包含 App、说明文档和许可证；strongSwan 由使用者独立安装。
 
 ## 隐私与安全
 

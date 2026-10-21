@@ -4,6 +4,7 @@ import argparse
 import base64
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import sys
@@ -23,7 +24,7 @@ def read_config(config_path):
         raise ValueError('Local VPN configuration is not valid JSON') from None
     if not isinstance(config, dict) or not isinstance(config.get('profiles'), dict):
         raise ValueError('Local VPN configuration must contain a profiles object')
-    if not config['profiles'] or not all(isinstance(key, str) and isinstance(item, dict)
+    if not all(isinstance(key, str) and isinstance(item, dict)
                                          for key, item in config['profiles'].items()):
         raise ValueError('Each local profile must be an object with a name')
     return config
@@ -42,6 +43,8 @@ def resolve_profile(profiles, name):
 def settings(config_path, profile=None, service=None):
     config = read_config(config_path)
     profiles = config['profiles']
+    if not profiles:
+        raise ValueError('No VPN profiles configured; add one in the MacVPN app')
     if profile:
         profile = resolve_profile(profiles, profile)
     if service:
@@ -59,7 +62,7 @@ def settings(config_path, profile=None, service=None):
         raise ValueError('direct_gateway must be true or false')
     for field in ('label', 'server', 'group', 'username', 'password', 'shared_secret'):
         if not isinstance(item.get(field), str) or not item[field]:
-            raise ValueError(f'Profile {profile} is missing a nonempty {field} in config.local.json')
+            raise ValueError(f'Profile {profile} is missing a nonempty {field} in the saved configuration')
     return dict(profile=profile, label=item['label'], server=item['server'], group=item['group'],
                 user=item['username'], password=item['password'], shared_secret=item['shared_secret'].encode(),
                 direct_gateway=item.get('direct_gateway', False))
@@ -227,7 +230,7 @@ def main():
     parser = argparse.ArgumentParser(description='Multi-VPN controller with a shared background strongSwan engine.')
     parser.add_argument('command', choices=['profiles', 'check', 'status', 'connect', 'disconnect',
                                            'run', 'test', 'shutdown', '_serve'])
-    parser.add_argument('--config', default=str(ROOT.parent / 'config.local.json'))
+    parser.add_argument('--config', default=str(Path(pwd.getpwuid(int(os.environ.get('SUDO_UID', os.getuid()))).pw_dir) / 'Library/Application Support/MacVPN/profiles.json'))
     parser.add_argument('--profile', help='Profile name or a configured alias')
     parser.add_argument('--service', help='Compatibility alias for an existing service name')
     parser.add_argument('--timeout', type=int, default=45)
@@ -247,6 +250,13 @@ def main():
     for executable in (SWANCTL, CHARON):
         if not executable.is_file() or not os.access(executable, os.X_OK):
             raise ValueError('Missing executable: ' + str(executable))
+    if args.command == 'shutdown':
+        if os.geteuid() != 0:
+            raise RuntimeError('Use ./strongvpn so sudo can authorize tunnel management')
+        rpc(runtime_path(), dict(action='shutdown'))
+        wait_backend_stopped(runtime_path())
+        print('VPN backend stopped.')
+        return 0
     cfg = settings(args.config, args.profile, args.service)
     if args.command == 'check':
         connection_config(cfg, cfg['shared_secret'])
@@ -257,7 +267,7 @@ def main():
         raise RuntimeError('Use ./strongvpn so sudo can authorize tunnel management')
     if args.command == '_serve':
         configs = {name: settings(args.config, name) for name in config['profiles']}
-        serve(os.environ.get('MACVPN_CONFIG_ORIGIN', str(Path(args.config).resolve())), configs, args.timeout)
+        serve(os.environ.get('MACVPN_CONFIG_ORIGIN', str(Path(args.config).resolve())), configs, args.timeout, config_revision=config.get('revision'))
         return 0
     if args.command in ('disconnect', 'shutdown'):
         if args.command == 'disconnect' and not (args.profile or args.service):

@@ -1,5 +1,6 @@
 # Local credentials and private experiments
 config.local.json
+profiles.json
 *.local.json
 config.local*.json
 .env

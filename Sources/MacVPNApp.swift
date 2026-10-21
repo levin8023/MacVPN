@@ -35,6 +35,7 @@ struct BackendStatus: Decodable {
     var stopping: Bool? = nil
     var reconnect_support: Int? = nil
     var storage_error: String? = nil
+    var config_revision: String? = nil
 }
 
 struct BridgeResponse: Decodable { let state: BackendStatus }
@@ -99,7 +100,7 @@ enum Bridge {
         for name in ["strongvpn.py", "vpn_backend.py", "app_bridge.py"] {
             try manager.copyItem(at: resources.appendingPathComponent(name), to: stage.appendingPathComponent(name))
         }
-        let snapshot = stage.appendingPathComponent("config.local.json")
+        let snapshot = stage.appendingPathComponent("profiles.json")
         try manager.copyItem(at: config, to: snapshot)
         try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: snapshot.path)
         let command = "/usr/bin/env SUDO_UID=\(getuid()) PYTHONDONTWRITEBYTECODE=1 MACVPN_CONFIG_ORIGIN=" + shellQuote(config.path)
@@ -132,16 +133,17 @@ final class VPNModel: ObservableObject {
     let preview: Bool
     private var timer: Timer?
     private var refreshingLiveStatus = false
+    private var document = ConfigurationDocument()
+    private var loadFailed = false
     var onChange: (() -> Void)?
     var onShowPanel: (() -> Void)?
     var onClosePanel: (() -> Void)?
+    var onEditProfile: ((String?) -> Void)?
 
     init(preview: Bool = false) {
         self.preview = preview
-        let path = UserDefaults.standard.string(forKey: "configPath")
-            ?? Bundle.main.object(forInfoDictionaryKey: "MacVPNConfigPath") as? String
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/MacVPN/config.local.json").path
-        configURL = URL(fileURLWithPath: path)
+        let path = ConfigurationStore.managedURL.path
+        configURL = ConfigurationStore.managedURL
         loadProfiles()
         if preview {
             state = BackendStatus(version: 4, timestamp: Date().timeIntervalSince1970, engine_ready: true,
@@ -160,28 +162,94 @@ final class VPNModel: ObservableObject {
 
     var fresh: Bool { state.map { now.timeIntervalSince1970 - $0.timestamp < 20 } ?? false }
     var stopping: Bool { fresh && state?.stopping == true }
-    var ready: Bool { fresh && !stopping && state?.version == 4 && state?.engine_ready == true && (state?.reconnect_support ?? 0) >= 2 && state?.config_path == configURL.path }
-    var activeCount: Int { fresh ? state?.profiles.values.filter { $0.phase == "connected" }.count ?? 0 : 0 }
-    var working: Bool { ready && state?.profiles.values.contains { ["connecting", "reconnecting", "disconnecting"].contains($0.phase) } == true }
-    var summary: String { stopping ? "正在停止后台…" : (ready ? (activeCount > 0 ? "\(activeCount) 条 VPN 已连接" : "后台就绪") : "后台尚未启用") }
+    var backendAvailable: Bool { fresh && !stopping && state?.version == 4 && state?.engine_ready == true && (state?.reconnect_support ?? 0) >= 2 && state?.config_path == configURL.path }
+    var configurationPending: Bool { backendAvailable && state?.config_revision != document.revision }
+    var ready: Bool { backendAvailable && !configurationPending }
+    var activeCount: Int { backendAvailable ? state?.profiles.values.filter { $0.phase == "connected" }.count ?? 0 : 0 }
+    var working: Bool { backendAvailable && state?.profiles.values.contains { ["connecting", "reconnecting", "disconnecting"].contains($0.phase) } == true }
+    var summary: String { profiles.isEmpty ? "添加第一条 VPN 开始使用" : (stopping ? "正在停止后台…" : (backendAvailable ? (activeCount > 0 ? "\(activeCount) 条 VPN 已连接" : "后台就绪") : "尚未连接")) }
 
     func loadProfiles() {
         do {
-            let data = try Data(contentsOf: configURL)
-            let config = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-            guard let entries = config?["profiles"] as? [String: [String: Any]], !entries.isEmpty else {
-                throw AppFailure(message: "配置文件需要包含 profiles。")
-            }
-            profiles = entries.keys.sorted().map { key in
-                VPNProfile(id: key, label: entries[key]?["label"] as? String ?? key,
-                           server: entries[key]?["server"] as? String ?? "")
-            }
-            for profile in profiles {
-                let key = "reconnect.\(profile.id)"
-                preferences[profile.id] = UserDefaults.standard.object(forKey: key) as? Bool ?? true
-            }
+            document = try ConfigurationStore(url: configURL).load()
+            loadFailed = false
+            updateProfiles()
             error = nil
-        } catch { self.error = "无法读取配置，请选择 config.local.json。\n\(error.localizedDescription)" }
+        } catch {
+            loadFailed = true
+            self.error = "无法读取 App 的配置存储，原数据已保留。\n\(error.localizedDescription)"
+        }
+    }
+
+    private func updateProfiles() {
+        profiles = document.profiles.map { VPNProfile(id: $0.key, label: $0.value.label, server: $0.value.server) }
+            .sorted { $0.label.localizedStandardCompare($1.label) == .orderedAscending }
+        for profile in profiles {
+            preferences[profile.id] = UserDefaults.standard.object(forKey: "reconnect.\(profile.id)") as? Bool ?? true
+        }
+        onChange?()
+    }
+
+    func draft(for id: String?) -> ProfileDraft {
+        if let id, let profile = document.profiles[id] { return ProfileDraft(id: id, profile: profile) }
+        return ProfileDraft()
+    }
+
+    func save(_ draft: ProfileDraft) throws {
+        guard !preview else { throw AppFailure(message: "预览模式不会保存配置。") }
+        guard !loadFailed else { throw AppFailure(message: "配置存储无法读取，已阻止覆盖原数据。") }
+        let profile = try draft.validated()
+        guard document.profiles[draft.id] != profile else { return }
+        var next = document
+        next.profiles[draft.id] = profile
+        if next.default_profile == nil { next.default_profile = draft.id }
+        next.revision = UUID().uuidString
+        try ConfigurationStore(url: configURL).save(next)
+        document = next
+        updateProfiles()
+        refresh()
+    }
+
+    func remove(_ profile: VPNProfile) {
+        guard !preview else { return }
+        let alert = NSAlert()
+        alert.messageText = "删除“\(profile.label)”？"
+        alert.informativeText = "此线路的认证信息将从 App 中删除；若正在连接，会先断开此线路。其他线路继续运行。"
+        alert.addButton(withTitle: "删除")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn, !loadFailed, !busy else { return }
+        busy = true
+        let disconnect = backendAvailable && state?.profiles[profile.id]?.phase != "disconnected" && state?.profiles[profile.id] != nil
+        Task {
+            do {
+                if disconnect {
+                    state = try await Task.detached {
+                        var result = try Bridge.request("disconnect", profile: profile.id)
+                        let deadline = Date().addingTimeInterval(65)
+                        while result.profiles[profile.id]?.phase != "disconnected" {
+                            guard Date() < deadline else { throw AppFailure(message: "断开尚未完成，未删除配置，请稍后重试。") }
+                            try await Task.sleep(nanoseconds: 250_000_000)
+                            result = try Bridge.request("status")
+                        }
+                        return result
+                    }.value
+                }
+                var next = document
+                next.profiles.removeValue(forKey: profile.id)
+                if next.default_profile == profile.id { next.default_profile = next.profiles.keys.sorted().first }
+                next.revision = UUID().uuidString
+                try ConfigurationStore(url: configURL).save(next)
+                document = next
+                preferences.removeValue(forKey: profile.id)
+                UserDefaults.standard.removeObject(forKey: "reconnect.\(profile.id)")
+                updateProfiles()
+                if next.profiles.isEmpty && backendAvailable {
+                    state = try await Task.detached { try Bridge.request("shutdown") }.value
+                }
+            } catch { self.error = error.localizedDescription }
+            busy = false
+            refresh()
+        }
     }
 
     func refresh() {
@@ -224,6 +292,7 @@ final class VPNModel: ObservableObject {
     }
 
     func enable() {
+        guard !profiles.isEmpty else { onEditProfile?(nil); return }
         loadProfiles()
         let config = configURL
         let prefs = preferences
@@ -231,13 +300,13 @@ final class VPNModel: ObservableObject {
     }
 
     func toggle(_ profile: VPNProfile) {
-        let connected = ready && state?.profiles[profile.id]?.desired == true
+        let connected = backendAvailable && state?.profiles[profile.id]?.desired == true
         let needsBackend = !ready
         let config = configURL
         let prefs = preferences
         let auto = preferences[profile.id] ?? true
         perform {
-            if needsBackend { _ = try Bridge.prepare(config: config, preferences: prefs) }
+            if needsBackend && !connected { _ = try Bridge.prepare(config: config, preferences: prefs) }
             return try Bridge.request(connected ? "disconnect" : "connect", profile: profile.id,
                                       enabled: connected ? nil : auto)
         }
@@ -246,23 +315,10 @@ final class VPNModel: ObservableObject {
     func setReconnect(_ profile: VPNProfile, _ enabled: Bool) {
         preferences[profile.id] = enabled
         UserDefaults.standard.set(enabled, forKey: "reconnect.\(profile.id)")
-        if ready { perform { try Bridge.request("set-reconnect", profile: profile.id, enabled: enabled) } }
+        if backendAvailable { perform { try Bridge.request("set-reconnect", profile: profile.id, enabled: enabled) } }
     }
 
     func shutdown() { perform { try Bridge.request("shutdown") } }
-
-    func chooseConfig() {
-        let panel = NSOpenPanel()
-        panel.title = "选择 VPN 配置文件"
-        panel.allowedContentTypes = [.json]
-        panel.allowsMultipleSelection = false
-        panel.directoryURL = configURL.deletingLastPathComponent()
-        if panel.runModal() == .OK, let url = panel.url {
-            configURL = url.standardizedFileURL
-            UserDefaults.standard.set(configURL.path, forKey: "configPath")
-            loadProfiles()
-        }
-    }
 
     func setLogin(_ enabled: Bool) {
         do {
@@ -276,7 +332,7 @@ final class VPNModel: ObservableObject {
 struct VPNCard: View {
     @ObservedObject var model: VPNModel
     let profile: VPNProfile
-    private var row: VPNStatus? { model.ready ? model.state?.profiles[profile.id] : nil }
+    private var row: VPNStatus? { model.backendAvailable ? model.state?.profiles[profile.id] : nil }
     private var phase: String { row?.phase ?? "unknown" }
     private var color: Color {
         if row?.route_error != nil { return .orange }
@@ -306,8 +362,8 @@ struct VPNCard: View {
                 Image(systemName: "network").font(.system(size: 20)).foregroundStyle(color)
                     .frame(width: 36, height: 36).background(color.opacity(0.10), in: RoundedRectangle(cornerRadius: 9))
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(profile.id).font(.system(size: 14, weight: .semibold))
-                    Text("\(profile.label) · \(profile.server)").font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text(profile.label).font(.system(size: 14, weight: .semibold))
+                    Text(profile.server).font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 6)
                 HStack(spacing: 5) {
@@ -323,7 +379,7 @@ struct VPNCard: View {
                 Text("\(Int(ceil(retry - model.now.timeIntervalSince1970))) 秒后重试")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             }
-            if phase == "auth_failed" { Text("请检查 JSON 中的认证信息，更新后重新加载后台。")
+            if phase == "auth_failed" { Text("请编辑此线路的认证信息，保存后应用更改。")
                 .font(.system(size: 11)).foregroundStyle(.red) }
             if let issue = row?.route_error {
                 Text("隧道已建立，但内网路由未通过检查。\n\(issue)")
@@ -335,7 +391,13 @@ struct VPNCard: View {
                     .toggleStyle(.switch).controlSize(.mini).font(.system(size: 11))
                     .disabled(model.busy)
                 Spacer()
-                Button(row?.desired == true ? "断开" : "连接") { model.toggle(profile) }
+                Menu {
+                    Button("编辑…") { model.onEditProfile?(profile.id) }
+                    Button("删除…", role: .destructive) { model.remove(profile) }
+                } label: { Image(systemName: "ellipsis") }
+                .menuStyle(.borderlessButton).fixedSize().disabled(model.busy)
+                .accessibilityLabel("管理“\(profile.label)”")
+                Button(row?.desired == true ? "断开" : (model.configurationPending ? "应用并连接" : "连接")) { model.toggle(profile) }
                     .buttonStyle(.bordered).controlSize(.small)
                     .disabled(model.busy || model.stopping || phase == "disconnecting")
                     .help(model.ready ? "管理此 VPN 连接" : "首次连接会请求管理员授权并自动启用后台")
@@ -359,11 +421,12 @@ struct MenuContent: View {
                 }
                 Spacer()
                 if model.busy { ProgressView().controlSize(.small) }
+                Button { model.onEditProfile?(nil) } label: { Image(systemName: "plus.circle.fill").font(.system(size: 18)) }
+                    .buttonStyle(.plain).disabled(model.busy).help("新增 VPN").accessibilityLabel("新增 VPN")
                 Menu {
                     Button("打开控制面板") { model.onShowPanel?() }
                     Divider()
-                    Button("选择配置文件…") { model.chooseConfig() }
-                    Button("在 Finder 中显示配置") { NSWorkspace.shared.activateFileViewerSelecting([model.configURL]) }
+                    Button("新增 VPN…") { model.onEditProfile?(nil) }.disabled(model.busy)
                     Button("查看后台日志") { NSWorkspace.shared.open(Bridge.runtime.appendingPathComponent("strongvpn-backend.log")) }
                     Divider()
                     Toggle("登录时打开 MacVPN", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLogin($0) }))
@@ -380,11 +443,19 @@ struct MenuContent: View {
                 .help("关闭面板（Esc）")
                 .accessibilityLabel("关闭面板")
             }
-            if !model.ready {
+            if model.configurationPending {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("配置已保存，应用后生效。当前连接继续运行。")
+                    Text("应用更改会重新建立当前请求的连接。")
+                        .foregroundStyle(.secondary)
+                    Button("应用更改并恢复连接") { model.enable() }.disabled(model.busy)
+                }.font(.system(size: 11)).padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+            } else if !model.ready && !model.profiles.isEmpty {
                 VStack(alignment: .leading, spacing: 9) {
                     Text("点击任意线路的“连接”即可开始。")
                         .font(.system(size: 12, weight: .medium))
-                    Text("首次连接会自动启用后台，并请求 macOS 管理员授权。升级旧后台会短暂断开连接。")
+                    Text("首次连接会自动启用后台，并请求 macOS 管理员授权。已有其他后台时，会先断开它管理的连接。")
                         .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     Button("启用 VPN 后台…") { model.enable() }.buttonStyle(.borderedProminent)
                         .controlSize(.small).disabled(model.busy || model.stopping || model.profiles.isEmpty)
@@ -393,6 +464,13 @@ struct MenuContent: View {
             }
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    if model.profiles.isEmpty {
+                        VStack(spacing: 12) {
+                            Image(systemName: "network.badge.shield.half.filled").font(.system(size: 32)).foregroundStyle(.teal)
+                            Text("还没有 VPN 配置").font(.headline)
+                            Button("新增 VPN") { model.onEditProfile?(nil) }.buttonStyle(.borderedProminent).disabled(model.busy)
+                        }.frame(maxWidth: .infinity).padding(.vertical, 45)
+                    }
                     ForEach(model.profiles) { profile in VPNCard(model: model, profile: profile) }
                     if let overlaps = model.state?.route_overlaps, model.fresh, !overlaps.isEmpty {
                         Label("检测到内网网段重叠，请避免同时使用指向相同网段的线路。", systemImage: "exclamationmark.triangle")
@@ -472,6 +550,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var host: NSHostingController<MenuContent>!
     var localMonitor: Any?
     var globalMonitor: Any?
+    var editorWindow: NSWindow?
     var openedAt: TimeInterval = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -501,6 +580,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         model.onChange = { [weak self] in self?.updateIcon() }
         model.onShowPanel = { [weak self] in self?.showPanel() }
         model.onClosePanel = { [weak self] in self?.panel.close() }
+        model.onEditProfile = { [weak self] id in self?.showEditor(id: id) }
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown]) { [weak self] event in
             guard let self, self.panel.isVisible else { return event }
             if event.type == .keyDown, event.window === self.panel,
@@ -523,6 +603,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             UserDefaults.standard.set(true, forKey: "hasShownSetupPanel")
             showPanel()
         }
+    }
+
+    func showEditor(id: String?) {
+        if let editorWindow, editorWindow.isVisible {
+            editorWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 510, height: 610),
+                              styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        window.title = id == nil ? "新增 VPN" : "编辑 VPN"
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 400, height: 420)
+        let editorHost = NSHostingController(rootView: ProfileEditor(
+            draft: model.draft(for: id), editing: id != nil,
+            save: { [weak self, weak window] draft in
+                guard let self else { return }
+                try self.model.save(draft)
+                window?.close()
+                self.showPanel()
+            }, cancel: { [weak self, weak window] in window?.close(); self?.showPanel() }))
+        editorHost.sizingOptions = []
+        window.contentViewController = editorHost
+        editorWindow = window
+        window.center()
+        if let screen = NSScreen.main {
+            let visible = screen.visibleFrame.insetBy(dx: 12, dy: 12)
+            window.setFrame(window.frame.intersection(visible), display: false)
+        }
+        panel.close()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

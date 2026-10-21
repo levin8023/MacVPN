@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-from strongvpn import read_config, resolve_profile, settings
+from strongvpn import read_config, settings
 from vpn_backend import ensure_backend, rpc, runtime_path, wait_backend_stopped
 
 
@@ -28,23 +28,27 @@ def main():
     config = read_config(config_path)
     for name in config['profiles']:
         settings(config_path, name)
+    if not config['profiles']:
+        raise ValueError('Add a VPN profile before enabling the backend')
     restore = []
     try:
         existing = rpc(runtime_path(), dict(action='status'), timeout=2)['state']
     except (OSError, ValueError, RuntimeError):
         existing = None
-    if existing and (existing.get('version', 0) < 4 or existing.get('direct_gateway_support', 0) < 2 or existing.get('reconnect_support', 0) < 2):
+    origin = os.environ.get('MACVPN_CONFIG_ORIGIN', str(config_path))
+    if existing and (existing.get('version', 0) < 4 or
+                     existing.get('direct_gateway_support', 0) < 2 or
+                     existing.get('reconnect_support', 0) < 2 or
+                     existing.get('config_path') != origin or
+                     existing.get('config_revision') != config.get('revision')):
         for name, row in existing['profiles'].items():
-            if row.get('desired'):
-                try:
-                    restore.append(resolve_profile(config['profiles'], name))
-                except ValueError:
-                    pass
+            if row.get('desired') and name in config['profiles']:
+                restore.append((name, row.get('auto_reconnect', True)))
         rpc(runtime_path(), dict(action='shutdown'))
         wait_backend_stopped(runtime_path())
     runtime = ensure_backend(config_path, 45)
-    for name in restore:
-        rpc(runtime, dict(action='connect', profile=name))
+    for name, enabled in restore:
+        rpc(runtime, dict(action='connect', profile=name, auto_reconnect=enabled))
     print(json.dumps(rpc(runtime, dict(action='status')), ensure_ascii=False))
 
 

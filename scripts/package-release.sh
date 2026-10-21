@@ -11,7 +11,7 @@ STAGE=$(mktemp -d "$TASK_ROOT/.build/release/package.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT HUP INT TERM
 mkdir "$STAGE/MacVPN"
 cp -R build/MacVPN.app "$STAGE/MacVPN/"
-cp README.md config.example.json CHANGELOG.md "$STAGE/MacVPN/"
+cp README.md CHANGELOG.md "$STAGE/MacVPN/"
 if [ -f LICENSE ]; then cp LICENSE "$STAGE/MacVPN/"; fi
 ARCHIVE="$TASK_ROOT/dist/MacVPN-$VERSION-macos-arm64.zip"
 /usr/bin/ditto -c -k --norsrc --noextattr --noqtn --keepParent "$STAGE/MacVPN" "$ARCHIVE"

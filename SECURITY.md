@@ -6,6 +6,6 @@ If it is unavailable, open an issue requesting a private reporting channel witho
 
 The client manages privileged network processes and supports legacy IKEv1 gateways.
 Only use configurations and binaries you trust. Do not disable macOS security protections to run an unknown build.
-Credentials are stored in a local JSON file, not a managed credential store; protect it with file permissions.
+Credentials are stored in an app-managed JSON file under Application Support, with mode 600. It is plaintext local storage, not a keychain or an encrypted vault.
 
 No supported-release security response SLA is currently provided. This is preview software.

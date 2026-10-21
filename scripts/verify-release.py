@@ -12,8 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def verify(archive):
     private = [str(Path.home()).encode().lower()]
-    local = ROOT / 'config.local.json'
-    if local.exists():
+    local_files = [ROOT / 'config.local.json', Path.home() / 'Library/Application Support/MacVPN/profiles.json']
+    for local in local_files:
+        if not local.exists():
+            continue
         config = json.loads(local.read_text())
         for name, item in config.get('profiles', {}).items():
             values = [name, item.get('label', ''), item.get('server', ''),
@@ -26,7 +28,7 @@ def verify(archive):
                 if value:
                     private.append(('0s' + base64.b64encode(value.encode()).decode()).encode().lower())
     failures = []
-    allowed = {'MacVPN.app', 'README.md', 'config.example.json', 'LICENSE', 'CHANGELOG.md'}
+    allowed = {'MacVPN.app', 'README.md', 'LICENSE', 'CHANGELOG.md'}
     with zipfile.ZipFile(archive) as bundle:
         for item in bundle.infolist():
             path = Path(item.filename)
@@ -37,17 +39,13 @@ def verify(archive):
             if item.is_dir():
                 continue
             if ('__pycache__' in path.parts or path.name.endswith(('.log', '.pyc')) or
-                path.name == 'config.local.json'):
+                path.name in ('config.local.json', 'profiles.json')):
                 failures.append(item.filename)
             data = bundle.read(item)
             if any(value in data.lower() for value in private):
                 failures.append(item.filename)
             if path.name == 'Info.plist' and 'MacVPNConfigPath' in plistlib.loads(data):
                 failures.append(item.filename)
-        sample = json.loads(bundle.read('MacVPN/config.example.json'))
-        if any(row.get(field) for row in sample['profiles'].values()
-               for field in ('username', 'password', 'shared_secret', 'group')):
-            failures.append('config.example.json: authentication fields must be empty')
     if failures:
         raise SystemExit('Release verification failed in: ' + ', '.join(sorted(set(failures))))
     print('PASS: release contains only allowed files; no local credentials or developer home path found.')

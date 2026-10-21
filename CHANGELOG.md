@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0
+
+- Create, edit, and delete VPN profiles directly in the app, with masked authentication fields.
+- Start without preparing a configuration file; store profiles privately in Application Support.
+- Apply saved changes by configuration revision and restore retained connection requests.
+- Disconnect a profile before deleting it; keep other tunnels running until changes are applied.
+- Start fresh without importing or reading older external configuration files.
+
 ## 0.1.1
 
 - Keep tunnel control and reconnect workers running when status-cache or log writes fail.
