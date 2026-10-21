@@ -1,5 +1,6 @@
 """Offline concurrency tests. No real credentials, sudo, or VPN traffic required."""
 import fcntl
+import errno
 import contextlib
 import io
 import json
@@ -163,6 +164,73 @@ class BackendTests(unittest.TestCase):
         self.backend.connect('one', auto_reconnect=False)
         self.wait_for(lambda: self.phase('one') == 'failed')
         self.assertFalse(self.backend.snapshot()['profiles']['one']['desired'])
+
+    def test_disk_full_status_cache_does_not_stop_reconnect_or_peer(self):
+        with patch('vpn_backend.atomic_json', side_effect=OSError(errno.ENOSPC, 'Synthetic disk full')):
+            self.backend.connect('one')
+            self.backend.connect('two')
+            self.wait_for(lambda: self.phase('one') == self.phase('two') == 'connected')
+            self.assertIsNotNone(self.backend.snapshot()['storage_error'])
+            with self.engine.lock:
+                self.engine.installed.discard('one')
+            self.wait_for(lambda: self.engine.calls.count('one') >= 2 and self.phase('one') == 'connected')
+            self.assertEqual(self.engine.calls.count('two'), 1)
+            self.assertTrue(all(worker.is_alive() for worker in self.backend.workers.values()))
+        self.backend.publish()
+        self.assertIsNone(self.backend.snapshot()['storage_error'])
+        self.assertTrue((self.root / 'status.json').exists())
+
+    def test_disk_full_error_handler_and_log_write_do_not_kill_worker(self):
+        original = self.engine.status
+        failed = []
+        def status(profile):
+            if profile == 'one' and not failed:
+                failed.append(True)
+                raise RuntimeError('Synthetic control failure')
+            return original(profile)
+        self.engine.status = status
+        with patch('vpn_backend.os.open', side_effect=OSError(errno.ENOSPC, 'Synthetic disk full')):
+            self.backend.log('one', 'Synthetic diagnostic')
+            self.backend.connect('one')
+            self.wait_for(lambda: self.phase('one') == 'connected')
+            self.assertTrue(self.backend.workers['one'].is_alive())
+            self.assertIsNotNone(self.backend.snapshot()['storage_error'])
+        self.backend.log('one', 'Storage recovered')
+        self.backend.publish()
+        self.assertIsNone(self.backend.snapshot()['storage_error'])
+
+    def test_log_rotation_is_bounded_and_keeps_redaction(self):
+        self.backend.log_max_bytes = 1
+        for _ in range(5):
+            self.backend.log('one', 'Synthetic test-user test-password test-psk')
+        for name in ('strongvpn-backend.log', 'strongvpn-one.log'):
+            paths = list(self.root.glob(name + '*'))
+            self.assertEqual(len(paths), 3)
+            for path in paths:
+                text = path.read_text()
+                self.assertNotIn('test-password', text)
+                self.assertNotIn('test-psk', text)
+                self.assertIn('[REDACTED]', text)
+
+    def test_monitor_recovers_exited_worker_without_restarting_peer_or_engine(self):
+        self.backend.connect('one')
+        self.backend.connect('two')
+        self.wait_for(lambda: self.phase('one') == self.phase('two') == 'connected')
+        old_worker = self.backend.workers['one']
+        original = self.engine.status
+        exited = []
+        def status(profile):
+            if profile == 'one' and not exited:
+                exited.append(True)
+                # Escape the ordinary per-iteration Exception handler.
+                raise SystemExit('Synthetic worker exit')
+            return original(profile)
+        self.engine.status = status
+        self.wait_for(lambda: self.backend.workers['one'] is not old_worker and
+                      self.phase('one') == 'connected')
+        self.assertEqual(self.engine.starts, 1)
+        self.assertEqual(self.engine.calls.count('two'), 1)
+        self.assertEqual(self.engine.calls.count('one'), 1)
 
     def test_disconnect_during_handshake_removes_late_tunnel(self):
         self.engine.gates['one'] = threading.Event()
@@ -463,7 +531,7 @@ class ConfigTests(unittest.TestCase):
             def fake_rpc(runtime, request, **kwargs):
                 calls.append(request)
                 if len(calls) == 1:
-                    return dict(state=dict(version=4, direct_gateway_support=2, profiles={'old-one': {'desired': True},
+                    return dict(state=dict(version=4, direct_gateway_support=2, reconnect_support=1, profiles={'old-one': {'desired': True},
                                                                'other': {'desired': False}}))
                 return dict(state=dict(version=3, profiles={}))
 

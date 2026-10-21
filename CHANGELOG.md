@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- Keep tunnel control and reconnect workers running when status-cache or log writes fail.
+- Recover an exited profile worker without restarting the shared engine or peer tunnels.
+- Fall back to live local RPC when the status cache stops updating, and show storage errors.
+- Rotate diagnostic logs with two bounded backups.
+- Add regression coverage for full disks, error-handler write failures, and worker recovery.
+
 ## 0.1.0
 
 - Initial public preview for Apple Silicon macOS.

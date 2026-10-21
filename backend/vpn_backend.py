@@ -438,6 +438,9 @@ class Backend:
         self.log_lock = threading.Lock()
         self.redact = Redactor(configs)
         self.threads = []
+        self.workers = {}
+        self.storage_errors = {}
+        self.log_max_bytes = 5 * 1024 * 1024
         self.states = {name: dict(profile=name, label=cfg['label'], server=cfg['server'],
                                   phase='disconnected', desired=False, generation=0, attempts=0,
                                   handshake_timeout=timeout, auto_reconnect=True,
@@ -454,9 +457,23 @@ class Backend:
             paths.append(self.status_path.parent / ('strongvpn-' + profile + '.log'))
         with self.log_lock:
             for path in paths:
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644)
-                with os.fdopen(fd, 'w') as stream:
-                    stream.write(line)
+                try:
+                    # Keep two older files. Rotation and writes are best effort:
+                    # diagnostic I/O must never kill a tunnel worker or log reader.
+                    if path.exists() and path.stat().st_size >= self.log_max_bytes:
+                        older = Path(str(path) + '.2')
+                        previous = Path(str(path) + '.1')
+                        if previous.exists():
+                            os.replace(previous, older)
+                        os.replace(path, previous)
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644)
+                    with os.fdopen(fd, 'w') as stream:
+                        stream.write(line)
+                    with self.condition:
+                        self.storage_errors.pop(path.name, None)
+                except OSError as error:
+                    with self.condition:
+                        self.storage_errors[path.name] = error.errno
 
     def snapshot(self):
         with self.condition:
@@ -472,13 +489,23 @@ class Backend:
                             if ipaddress.ip_network(a).overlaps(ipaddress.ip_network(b)):
                                 overlaps.append(dict(profiles=[left, right], subnets=[a, b]))
             return dict(version=4, pid=os.getpid(), timestamp=time.time(), config_path=self.config_path,
-                        direct_gateway_support=2, reconnect_support=1,
+                        direct_gateway_support=2, reconnect_support=2,
+                        storage_error=('Status or log storage is unavailable; VPN control continues in memory'
+                                       if self.storage_errors else None),
                         engine_ready=self.engine_ready.is_set(), profiles=profiles, route_overlaps=overlaps,
                         stopping=self.stop_event.is_set() and not self.stopped)
 
     def publish(self):
         with self.publish_lock:
-            atomic_json(self.status_path, self.snapshot())
+            try:
+                atomic_json(self.status_path, self.snapshot())
+            except OSError as error:
+                # Do not log here: the log filesystem may have the same failure.
+                with self.condition:
+                    self.storage_errors['status.json'] = error.errno
+            else:
+                with self.condition:
+                    self.storage_errors.pop('status.json', None)
 
     def update(self, profile, generation=None, **changes):
         with self.condition:
@@ -609,6 +636,21 @@ class Backend:
                 delay = min(delay * 2, 300)
             self.stop_event.wait(self.poll_interval)
 
+    def _worker_entry(self, profile):
+        try:
+            self._worker(profile)
+        except Exception as error:
+            self.log(profile, 'VPN worker exited unexpectedly: ' + type(error).__name__)
+
+    def _start_worker(self, profile):
+        thread = threading.Thread(target=self._worker_entry, args=(profile,),
+                                  name='vpn-' + profile, daemon=True)
+        self.workers[profile] = thread
+        # Prune exited threads so repeated recoveries do not retain them forever.
+        self.threads = [item for item in self.threads if item.is_alive()]
+        self.threads.append(thread)
+        thread.start()
+
     def _monitor(self):
         delay = self.retry_interval
         while not self.stop_event.wait(self.poll_interval):
@@ -628,15 +670,22 @@ class Backend:
                     self.log(None, 'Engine restart failed: ' + str(error))
                     self.stop_event.wait(delay)
                     delay = min(delay * 2, 300)
+            for name, worker in list(self.workers.items()):
+                if not worker.is_alive() and not self.stop_event.is_set():
+                    with self.condition:
+                        state = self.states[name]
+                        if state['desired']:
+                            state.update(phase='reconnecting', next_retry=0,
+                                         error='VPN worker recovered; checking tunnel', updated_at=time.time())
+                    self.log(name, 'Restarting an exited VPN worker')
+                    self._start_worker(name)
             self.publish()
 
     def start(self):
         self.engine.start()
         self.engine_ready.set()
         for name in self.configs:
-            thread = threading.Thread(target=self._worker, args=(name,), daemon=True)
-            thread.start()
-            self.threads.append(thread)
+            self._start_worker(name)
         thread = threading.Thread(target=self._monitor, daemon=True)
         thread.start()
         self.threads.append(thread)

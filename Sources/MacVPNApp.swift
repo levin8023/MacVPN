@@ -34,6 +34,7 @@ struct BackendStatus: Decodable {
     let route_overlaps: [VPNOverlap]
     var stopping: Bool? = nil
     var reconnect_support: Int? = nil
+    var storage_error: String? = nil
 }
 
 struct BridgeResponse: Decodable { let state: BackendStatus }
@@ -130,6 +131,7 @@ final class VPNModel: ObservableObject {
     @Published var configURL: URL
     let preview: Bool
     private var timer: Timer?
+    private var refreshingLiveStatus = false
     var onChange: (() -> Void)?
     var onShowPanel: (() -> Void)?
     var onClosePanel: (() -> Void)?
@@ -147,7 +149,7 @@ final class VPNModel: ObservableObject {
                     "office-primary": VPNStatus(phase: "disconnected", desired: false, auto_reconnect: true, virtual_ips: [], remote_subnets: [], next_retry: 0),
                     "office-backup": VPNStatus(phase: "connected", desired: true, auto_reconnect: true, virtual_ips: ["10.20.0.2"], remote_subnets: ["10.30.0.0/24"], next_retry: 0),
                     "partner": VPNStatus(phase: "reconnecting", desired: true, auto_reconnect: true, virtual_ips: [], remote_subnets: [], next_retry: Date().timeIntervalSince1970 + 28)
-                ], route_overlaps: [], reconnect_support: 1)
+                ], route_overlaps: [], reconnect_support: 2)
         } else {
             refresh()
             timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -158,7 +160,7 @@ final class VPNModel: ObservableObject {
 
     var fresh: Bool { state.map { now.timeIntervalSince1970 - $0.timestamp < 20 } ?? false }
     var stopping: Bool { fresh && state?.stopping == true }
-    var ready: Bool { fresh && !stopping && state?.version == 4 && state?.engine_ready == true && (state?.reconnect_support ?? 0) >= 1 && state?.config_path == configURL.path }
+    var ready: Bool { fresh && !stopping && state?.version == 4 && state?.engine_ready == true && (state?.reconnect_support ?? 0) >= 2 && state?.config_path == configURL.path }
     var activeCount: Int { fresh ? state?.profiles.values.filter { $0.phase == "connected" }.count ?? 0 : 0 }
     var working: Bool { ready && state?.profiles.values.contains { ["connecting", "reconnecting", "disconnecting"].contains($0.phase) } == true }
     var summary: String { stopping ? "正在停止后台…" : (ready ? (activeCount > 0 ? "\(activeCount) 条 VPN 已连接" : "后台就绪") : "后台尚未启用") }
@@ -186,7 +188,18 @@ final class VPNModel: ObservableObject {
         guard !preview else { return }
         now = Date()
         if let data = try? Data(contentsOf: Bridge.runtime.appendingPathComponent("status.json")),
-           let value = try? JSONDecoder().decode(BackendStatus.self, from: data) { state = value }
+           let value = try? JSONDecoder().decode(BackendStatus.self, from: data),
+           state == nil || value.timestamp >= (state?.timestamp ?? 0) { state = value }
+        // A full/unwritable disk must not leave the UI stuck on the cached state.
+        if (state == nil || now.timeIntervalSince1970 - (state?.timestamp ?? 0) > 6), !refreshingLiveStatus {
+            refreshingLiveStatus = true
+            Task {
+                if let live = try? await Task.detached(priority: .utility, operation: {
+                    try Bridge.request("status")
+                }).value { state = live; onChange?() }
+                refreshingLiveStatus = false
+            }
+        }
         if ready, !busy, let rows = state?.profiles {
             for (name, row) in rows {
                 if let enabled = row.auto_reconnect {
@@ -386,6 +399,10 @@ struct MenuContent: View {
                             .font(.system(size: 11)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
                     }
                 }.padding(1)
+            }
+            if model.state?.storage_error != nil, model.fresh {
+                Label("状态或日志暂时无法写入磁盘，连接控制仍在运行。请检查可用空间和权限。", systemImage: "externaldrive.badge.exclamationmark")
+                    .font(.system(size: 11)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
             if let error = model.error {
                 HStack(alignment: .top) {

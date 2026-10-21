@@ -20,7 +20,7 @@ def main():
             if sys.argv[4] not in ('true', 'false'):
                 raise ValueError('Invalid preference')
             request['auto_reconnect' if action == 'connect' else 'enabled'] = sys.argv[4] == 'true'
-        print(json.dumps(rpc(runtime_path(), request), ensure_ascii=False))
+        print(json.dumps(rpc(runtime_path(), request, timeout=3 if action == 'status' else 20), ensure_ascii=False))
         return
     if sys.argv[1] != 'bootstrap' or os.geteuid() != 0:
         raise ValueError('Administrator authorization is required to enable the backend')
@@ -33,7 +33,7 @@ def main():
         existing = rpc(runtime_path(), dict(action='status'), timeout=2)['state']
     except (OSError, ValueError, RuntimeError):
         existing = None
-    if existing and (existing.get('version', 0) < 4 or existing.get('direct_gateway_support', 0) < 2 or existing.get('reconnect_support', 0) < 1):
+    if existing and (existing.get('version', 0) < 4 or existing.get('direct_gateway_support', 0) < 2 or existing.get('reconnect_support', 0) < 2):
         for name, row in existing['profiles'].items():
             if row.get('desired'):
                 try:
