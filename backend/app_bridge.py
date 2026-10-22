@@ -38,7 +38,7 @@ def main():
     origin = os.environ.get('MACVPN_CONFIG_ORIGIN', str(config_path))
     if existing and (existing.get('version', 0) < 4 or
                      existing.get('direct_gateway_support', 0) < 2 or
-                     existing.get('reconnect_support', 0) < 2 or
+                     existing.get('reconnect_support', 0) < 3 or
                      existing.get('hardening_support', 0) < 1 or
                      existing.get('config_path') != origin or
                      existing.get('config_revision') != config.get('revision')):

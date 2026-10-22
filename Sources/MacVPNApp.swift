@@ -18,6 +18,7 @@ struct VPNStatus: Decodable {
     var error: String?
     var route_error: String? = nil
     var tunnel_interface: String? = nil
+    var failure_reason: String? = nil
 }
 
 struct VPNOverlap: Decodable {
@@ -154,7 +155,7 @@ final class VPNModel: ObservableObject {
                     "office-primary": VPNStatus(phase: "disconnected", desired: false, auto_reconnect: true, virtual_ips: [], remote_subnets: [], next_retry: 0),
                     "office-backup": VPNStatus(phase: "connected", desired: true, auto_reconnect: true, virtual_ips: ["10.20.0.2"], remote_subnets: ["10.30.0.0/24"], next_retry: 0),
                     "partner": VPNStatus(phase: "reconnecting", desired: true, auto_reconnect: true, virtual_ips: [], remote_subnets: [], next_retry: Date().timeIntervalSince1970 + 28)
-                ], route_overlaps: [], reconnect_support: 2, hardening_support: 1)
+                ], route_overlaps: [], reconnect_support: 3, hardening_support: 1)
         } else {
             refresh()
             timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -167,7 +168,8 @@ final class VPNModel: ObservableObject {
     var stopping: Bool { fresh && state?.stopping == true }
     var backendAvailable: Bool { fresh && !stopping && state?.version == 4 && state?.engine_ready == true && (state?.reconnect_support ?? 0) >= 2 && state?.config_path == configURL.path }
     var configurationPending: Bool {
-        backendAvailable && (state?.config_revision != document.revision || (state?.hardening_support ?? 0) < 1)
+        backendAvailable && (state?.config_revision != document.revision || (state?.hardening_support ?? 0) < 1 ||
+                             (state?.reconnect_support ?? 0) < 3)
     }
     var ready: Bool { backendAvailable && !configurationPending }
     var activeCount: Int { backendAvailable ? state?.profiles.values.filter { $0.phase == "connected" }.count ?? 0 : 0 }
@@ -354,12 +356,23 @@ struct VPNCard: View {
         switch phase {
         case "connected": return "已连接"
         case "connecting": return "连接中"
-        case "reconnecting": return "等待重连"
+        case "reconnecting":
+            return (row?.next_retry ?? 0) > model.now.timeIntervalSince1970 ? "等待重试" : "重新连接中"
         case "disconnecting": return "断开中"
         case "auth_failed": return "认证失败"
         case "failed": return "连接中断"
         case "disconnected": return "未连接"
         default: return "等待后台"
+        }
+    }
+    private var failureDetail: String? {
+        switch row?.failure_reason {
+        case "mode_config_no_response": return "上次已通过认证，但未收到网关的地址配置响应。"
+        case "ipsec_negotiation_failed": return "上次未完成 IPsec 隧道协商。"
+        case "ike_negotiation_failed": return "上次未完成网关握手。"
+        case "control_unavailable": return "后台控制操作异常，稍后重试。"
+        case "tunnel_not_installed": return "隧道尚未建立，后台会继续检查和重试。"
+        default: return nil
         }
     }
     var body: some View {
@@ -384,6 +397,10 @@ struct VPNCard: View {
             if phase == "reconnecting", let retry = row?.next_retry, retry > model.now.timeIntervalSince1970 {
                 Text("\(Int(ceil(retry - model.now.timeIntervalSince1970))) 秒后重试")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            if phase == "reconnecting", let detail = failureDetail {
+                Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if phase == "auth_failed" { Text("请编辑此线路的认证信息，保存后应用更改。")
                 .font(.system(size: 11)).foregroundStyle(.red) }

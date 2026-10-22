@@ -431,7 +431,17 @@ class StrongSwanEngine:
         self.log(profile, output.rstrip())
         auth_failed = bool(re.search(r'XAuth authentication.*failed|no shared key found|AUTHENTICATION_FAILED',
                                      output, re.I))
-        return dict(auth_failed=auth_failed, success=code == 0)
+        reason = None
+        if auth_failed:
+            reason = 'authentication_failed'
+        elif code:
+            if 'CPRQ(ADDR' in output and 'CPRP(ADDR' not in output:
+                reason = 'mode_config_no_response'
+            elif 'QUICK_MODE' in output:
+                reason = 'ipsec_negotiation_failed'
+            else:
+                reason = 'ike_negotiation_failed'
+        return dict(auth_failed=auth_failed, success=code == 0, failure_reason=reason)
 
     def terminate(self, profile):
         ike, _ = connection_names(profile)
@@ -483,7 +493,7 @@ class Backend:
         self.states = {name: dict(profile=name, label=cfg['label'], server=cfg['server'],
                                   phase='disconnected', desired=False, generation=0, attempts=0,
                                   handshake_timeout=timeout, auto_reconnect=True,
-                                  error=None, route_error=None, tunnel_interface=None,
+                                  error=None, failure_reason=None, route_error=None, tunnel_interface=None,
                                   virtual_ips=[], remote_subnets=[], next_retry=0,
                                   updated_at=time.time()) for name, cfg in configs.items()}
         self.engine = engine or StrongSwanEngine(configs, runtime, self.log)
@@ -529,7 +539,7 @@ class Backend:
                             if ipaddress.ip_network(a).overlaps(ipaddress.ip_network(b)):
                                 overlaps.append(dict(profiles=[left, right], subnets=[a, b]))
             return dict(version=4, pid=os.getpid(), timestamp=time.time(), config_path=self.config_path,
-                        direct_gateway_support=2, reconnect_support=2, hardening_support=1,
+                        direct_gateway_support=2, reconnect_support=3, hardening_support=1,
                         config_revision=self.config_revision,
                         storage_error=('Status or log storage is unavailable; VPN control continues in memory'
                                        if self.storage_errors else None),
@@ -579,7 +589,7 @@ class Backend:
             if state['desired']:
                 return
             state.update(desired=True, generation=state['generation'] + 1, phase='connecting',
-                         error=None, attempts=0, next_retry=0,
+                         error=None, failure_reason=None, attempts=0, next_retry=0,
                          handshake_timeout=timeout if timeout is not None else self.timeout)
             self.condition.notify_all()
         self.publish()
@@ -596,6 +606,7 @@ class Backend:
     def _worker(self, profile):
         delay = self.retry_interval
         retry_at, retry_generation = 0, None
+        control_backoff = False
         while not self.stop_event.is_set():
             with self.condition:
                 state = dict(self.states[profile])
@@ -608,8 +619,12 @@ class Backend:
             if generation != retry_generation:
                 retry_at, retry_generation = 0, generation
                 delay = self.retry_interval
+                control_backoff = False
             remaining = retry_at - time.monotonic()
-            if remaining > 0:
+            # A timed-out swanctl waiter does not cancel charon's handshake.
+            # During handshake backoff, keep checking for late completion.
+            # Only control failures should suspend queries to a failing API.
+            if remaining > 0 and control_backoff:
                 self.stop_event.wait(min(self.poll_interval, remaining))
                 continue
             try:
@@ -617,23 +632,25 @@ class Backend:
                 # queues cleanup after an in-flight handshake, without touching peers.
                 if not state['desired']:
                     self.engine.terminate(profile)
-                    self.update(profile, generation, phase='disconnected', error=None,
+                    self.update(profile, generation, phase='disconnected', error=None, failure_reason=None,
                                 route_error=None, tunnel_interface=None, virtual_ips=[], remote_subnets=[], next_retry=0)
                     continue
                 sa = self.engine.status(profile)
+                control_backoff = False
                 if sa['installed']:
-                    self.update(profile, generation, phase='connected', error=None,
+                    self.update(profile, generation, phase='connected', error=None, failure_reason=None,
                                 route_error=sa.get('route_error'), tunnel_interface=sa.get('tunnel_interface'),
                                 virtual_ips=sa['virtual_ips'], remote_subnets=sa['remote_subnets'], next_retry=0)
                     delay = self.retry_interval
+                    retry_at = 0
                 elif state['attempts'] > 0 and not state['auto_reconnect']:
                     self.engine.terminate(profile)
                     self.update(profile, generation, phase='failed', desired=False,
                                 virtual_ips=[], remote_subnets=[], next_retry=0,
                                 error='Tunnel disconnected; automatic reconnect is off')
-                else:
+                elif remaining <= 0:
                     self.update(profile, generation, phase='connecting' if state['attempts'] == 0 else 'reconnecting',
-                                attempts=state['attempts'] + 1)
+                                attempts=state['attempts'] + 1, next_retry=0, error=None)
                     # The second check prevents a queued disconnect from starting a new handshake.
                     with self.condition:
                         if self.states[profile]['generation'] != generation or not self.states[profile]['desired']:
@@ -647,14 +664,16 @@ class Backend:
                     if result['auth_failed']:
                         self.engine.terminate(profile)
                         self.update(profile, generation, desired=False, phase='auth_failed',
-                                    error='Authentication failed; retries paused', next_retry=0)
+                                    error='Authentication failed; retries paused',
+                                    failure_reason='authentication_failed', next_retry=0)
                     else:
                         sa = self.engine.status(profile)
                         if sa['installed']:
-                            self.update(profile, generation, phase='connected', error=None,
+                            self.update(profile, generation, phase='connected', error=None, failure_reason=None,
                                         route_error=sa.get('route_error'), tunnel_interface=sa.get('tunnel_interface'),
                                         virtual_ips=sa['virtual_ips'], remote_subnets=sa['remote_subnets'], next_retry=0)
                             delay = self.retry_interval
+                            retry_at = 0
                         else:
                             # Do not accumulate partially negotiated SAs on retries.
                             # initiate() clears stale IKE state before the next attempt.
@@ -665,6 +684,7 @@ class Backend:
                             self.update(profile, generation, phase='reconnecting' if retry else 'failed', desired=retry,
                                         virtual_ips=[], remote_subnets=[], route_error=None, tunnel_interface=None,
                                         error='Tunnel not installed; waiting to retry' if retry else 'Connection failed; automatic reconnect is off',
+                                        failure_reason=result.get('failure_reason') or 'tunnel_not_installed',
                                         next_retry=time.time() + delay if retry else 0)
                             delay = min(delay * 2, 300)
             except Exception as error:
@@ -678,11 +698,13 @@ class Backend:
                     except Exception:
                         self.log(profile, 'Session cleanup pending after control failure')
                 retry_at = time.monotonic() + delay
+                control_backoff = True
                 self.update(profile, generation,
                             phase=('reconnecting' if retry else 'failed') if current['desired'] else 'disconnecting',
                             desired=retry if current['desired'] else False,
                             virtual_ips=[], remote_subnets=[], route_error=None, tunnel_interface=None,
                             error='Control operation failed; waiting to retry' if retry else 'Control operation failed',
+                            failure_reason='control_unavailable',
                             next_retry=time.time() + delay)
                 delay = min(delay * 2, 300)
             self.stop_event.wait(self.poll_interval)

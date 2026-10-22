@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.4
+
+- Keep polling tunnel health while waiting to retry a timed-out handshake, so late completion is detected promptly.
+- Retain monotonic backoff for control-interface failures and avoid starting duplicate handshakes during retry waits.
+- Distinguish active reconnection from retry countdowns and display safe protocol-stage failure hints.
+- Reload older backends when applying the reconnect fix; keep credential storage and administrator bootstrap unchanged.
+
 ## 0.2.3
 
 - Restrict runtime status, logs, and the control socket to the controlling user; keep VICI root-only.

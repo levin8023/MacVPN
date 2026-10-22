@@ -142,6 +142,44 @@ class BackendTests(unittest.TestCase):
             self.engine.installed.discard('one')
         self.wait_for(lambda: self.engine.calls.count('one') >= 3 and self.phase('one') == 'connected')
 
+    def test_late_handshake_completion_is_seen_during_retry_backoff(self):
+        self.backend.retry_interval = 1.0
+        self.engine.failures['one'] = 1
+        self.backend.connect('two')
+        self.wait_for(lambda: self.phase('two') == 'connected')
+        self.backend.connect('one')
+        self.wait_for(lambda: self.phase('one') == 'reconnecting')
+        deadline = self.backend.snapshot()['profiles']['one']['next_retry']
+        self.assertGreater(deadline - time.time(), 0.7)
+        # Do not launch another handshake while the retry timer is pending.
+        time.sleep(0.08)
+        self.assertEqual(self.engine.calls.count('one'), 1)
+        # A timed-out command may leave charon negotiating in the background.
+        with self.engine.lock:
+            self.engine.installed.add('one')
+        self.wait_for(lambda: self.phase('one') == 'connected', timeout=0.4)
+        self.assertLess(time.time(), deadline)
+        row = self.backend.snapshot()['profiles']['one']
+        self.assertEqual(row['next_retry'], 0)
+        self.assertIsNone(row['failure_reason'])
+        self.assertEqual(self.engine.calls.count('one'), 1)
+        self.assertEqual(self.engine.calls.count('two'), 1)
+
+    def test_new_handshake_clears_wait_countdown_and_stale_error(self):
+        self.backend.retry_interval = 0.25
+        self.engine.failures['one'] = 1
+        self.backend.connect('one')
+        self.wait_for(lambda: self.phase('one') == 'reconnecting')
+        self.assertEqual(self.backend.snapshot()['profiles']['one']['failure_reason'], 'tunnel_not_installed')
+        self.engine.gates['one'] = threading.Event()
+        self.wait_for(lambda: self.engine.calls.count('one') == 2)
+        row = self.backend.snapshot()['profiles']['one']
+        self.assertEqual(row['phase'], 'reconnecting')
+        self.assertEqual(row['next_retry'], 0)
+        self.assertIsNone(row['error'])
+        self.engine.gates['one'].set()
+        self.wait_for(lambda: self.phase('one') == 'connected')
+
     def test_handshake_timeout_retries_without_affecting_other_profile(self):
         original = self.engine.initiate
         failed = []
@@ -531,6 +569,24 @@ class RouteTests(unittest.TestCase):
 
 
 class SessionCleanupTests(unittest.TestCase):
+    def test_handshake_failure_reason_uses_safe_protocol_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = StrongSwanEngine(configurations(), Path(directory), lambda *args: None)
+            cases = [
+                (1, 'XAuth authentication successful\nCPRQ(ADDR DNS)\nsending retransmit', 'mode_config_no_response'),
+                (1, 'CPRQ(ADDR DNS)\nCPRP(ADDR DNS)\ngenerating QUICK_MODE request', 'ipsec_negotiation_failed'),
+                (1, 'generating AGGRESSIVE request', 'ike_negotiation_failed'),
+                (1, 'XAuth authentication of test-user failed', 'authentication_failed'),
+                (0, 'initiate completed successfully', None),
+            ]
+            with patch.object(engine, 'clear_sessions'):
+                for code, output, expected in cases:
+                    with self.subTest(expected=expected):
+                        engine.swan = lambda *args, **kwargs: (code, output)
+                        result = engine.initiate('one', 45)
+                        self.assertEqual(result['failure_reason'], expected)
+                        self.assertNotIn('test-user', json.dumps(result))
+
     def test_route_scans_are_cached_but_sa_health_is_always_queried(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = StrongSwanEngine(configurations(), Path(directory), lambda *args: None)
@@ -659,8 +715,9 @@ class ConfigTests(unittest.TestCase):
 
     def test_configuration_reload_uses_revision_and_preserves_only_retained_profiles(self):
         import app_bridge
-        for existing_revision, hardening in (('previous', 1), ('current', 1), ('current', 0)):
-            with self.subTest(existing_revision=existing_revision, hardening=hardening), tempfile.TemporaryDirectory() as directory:
+        for existing_revision, hardening, reconnect in (('previous', 1, 3), ('current', 1, 3),
+                                                        ('current', 0, 3), ('current', 1, 2)):
+            with self.subTest(existing_revision=existing_revision, hardening=hardening, reconnect=reconnect), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 config_path = root / 'profiles.json'
                 config_path.write_text(json.dumps({'revision': 'current', 'profiles': {
@@ -669,7 +726,7 @@ class ConfigTests(unittest.TestCase):
                 calls = []
                 def fake_rpc(runtime, request, **kwargs):
                     calls.append(request)
-                    return dict(state=dict(version=4, direct_gateway_support=2, reconnect_support=2, hardening_support=hardening,
+                    return dict(state=dict(version=4, direct_gateway_support=2, reconnect_support=reconnect, hardening_support=hardening,
                                            config_path=str(config_path.resolve()), config_revision=existing_revision,
                                            profiles={'one': {'desired': True, 'auto_reconnect': False},
                                                      'deleted': {'desired': True}}))
@@ -682,7 +739,7 @@ class ConfigTests(unittest.TestCase):
                      patch('app_bridge.ensure_backend', return_value=root), \
                      contextlib.redirect_stdout(io.StringIO()) as output:
                     app_bridge.main()
-                if existing_revision == 'previous' or hardening == 0:
+                if existing_revision == 'previous' or hardening == 0 or reconnect < 3:
                     self.assertIn(dict(action='shutdown'), calls)
                     self.assertIn(dict(action='connect', profile='one', auto_reconnect=False), calls)
                 else:
